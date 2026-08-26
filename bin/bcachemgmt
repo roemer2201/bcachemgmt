@@ -1,0 +1,1410 @@
+#!/usr/bin/env bash
+#
+# bcachemgmt
+#
+# Description:
+#   Read-only management front end for Linux bcache setups. It collects the
+#   state of all registered bcache devices from sysfs and presents it either
+#   as a compact human readable overview ("status") or as a list of health
+#   check findings ("doctor"). Both commands can emit JSON so the output can
+#   be consumed by monitoring or configuration management.
+#
+#   The tool never writes to sysfs and never modifies a device. It is safe to
+#   run at any time, including on production systems.
+#
+# Program flow:
+#   1. Parse arguments and resolve configuration (CLI > env > default).
+#   2. Verify prerequisites (bcache sysfs interface, optional helper tools).
+#   3. Collect state from sysfs: cache sets, cache devices, backing devices,
+#      flash volumes and block devices carrying an unregistered superblock.
+#   4. Enrich the collected data with stable names (/dev/disk/by-id) and with
+#      filesystem usage information (lsblk).
+#   5. Run the requested command:
+#        status -> render the overview (table or JSON)
+#        doctor -> run the health checks and render the findings
+#   6. Exit 0 when there is nothing to report, non-zero on findings or errors.
+#
+# Usage:
+#   bcachemgmt status [-l] [-j] [DEVICE ...]
+#   bcachemgmt doctor [-j] [-m PERCENT]
+#
+# Requirements:
+#   bash 4.2 or newer, a kernel with bcache support. "lsblk" is optional and
+#   only used to detect unregistered devices and to show filesystem usage.
+#
+# Version: 1.0.0  (2026-08-26)
+
+# Robustness baseline. Sysfs reads that are allowed to fail are handled
+# explicitly inside sysfs_read().
+set -euo pipefail
+
+# Globs that match nothing must expand to nothing, not to the pattern itself.
+# The whole sysfs walk below relies on this.
+shopt -s nullglob
+
+SCRIPT_NAME="$(basename -- "${0}")"
+SCRIPT_VERSION="1.0.0"
+
+# --- Defaults seeded from environment variables ---------------------------
+# Precedence: command-line argument > environment variable > built-in default.
+SYSFS_ROOT="${BCACHEMGMT_SYSFS_ROOT:-/sys}"
+JSON_OUTPUT="${BCACHEMGMT_JSON:-0}"
+LONG_OUTPUT="${BCACHEMGMT_LONG:-0}"
+COLOR_MODE="${BCACHEMGMT_COLOR:-auto}"
+MIN_AVAILABLE="${BCACHEMGMT_MIN_AVAILABLE:-10}"
+
+COMMAND=""
+declare -a DEVICE_FILTER=()
+
+# ==========================================================================
+# Help
+# ==========================================================================
+
+# Print usage information to STDOUT.
+usage() {
+    cat <<'EOF'
+Usage: bcachemgmt COMMAND [OPTIONS] [DEVICE ...]
+
+Read-only overview and health check for bcache setups. The tool only reads
+sysfs; it never attaches, detaches, stops or formats a device.
+
+Commands:
+  status            Show an overview of all bcache devices, their backing
+                    devices, caches, cache mode and state.
+  doctor            Run health checks and report everything that looks wrong.
+  help              Show this help and exit.
+  version           Show the version and exit.
+
+Arguments:
+  DEVICE            Optional filter for "status". Matches the bcache device
+                    name (bcache0), the backing device name (sdb1) or a
+                    device path (/dev/sdb1). May be given more than once.
+
+Options:
+  -j, --json        Emit machine readable JSON instead of text.
+                    Env: BCACHEMGMT_JSON           Default: 0
+  -l, --long        "status" only: print a detail block per device in
+                    addition to the overview table.
+                    Env: BCACHEMGMT_LONG           Default: 0
+  -m, --min-available PERCENT
+                    "doctor" only: warn when a cache set reports less than
+                    PERCENT available cache space.
+                    Env: BCACHEMGMT_MIN_AVAILABLE  Default: 10
+      --color WHEN  Colorize text output: always, never or auto (auto means
+                    color only when STDOUT is a terminal).
+                    Env: BCACHEMGMT_COLOR          Default: auto
+      --no-color    Shorthand for --color never.
+                    Env: BCACHEMGMT_COLOR          Default: auto
+  -r, --sysfs-root DIR
+                    Read the device state below DIR instead of /sys. Intended
+                    for testing against a captured sysfs tree; checks that
+                    need the live system are skipped when DIR is not /sys.
+                    Env: BCACHEMGMT_SYSFS_ROOT     Default: /sys
+  -h, --help        Show this help and exit.
+  -V, --version     Show the version and exit.
+
+Precedence for every option: command-line argument > environment variable
+> built-in default.
+
+Exit status:
+  0  Command finished and, for "doctor", no problem was found.
+  1  An error occurred, or "doctor" reported at least one warning or a
+     critical finding. The message itself is the primary information.
+  2  Invalid invocation (unknown option, missing argument, unknown command).
+
+Examples:
+  bcachemgmt status
+  bcachemgmt status --long bcache0
+  bcachemgmt status --json | jq '.backing_devices[].cache_mode'
+  bcachemgmt doctor --min-available 20
+EOF
+}
+
+# ==========================================================================
+# Output helpers
+# ==========================================================================
+
+# Report an explicit, anticipated failure on STDERR and exit non-zero.
+die() {
+    printf '%s: error: %s\n' "${SCRIPT_NAME}" "$*" >&2
+    exit 1
+}
+
+# Report an invalid invocation on STDERR and exit with the conventional
+# status 2 for usage errors.
+die_usage() {
+    printf '%s: %s\n' "${SCRIPT_NAME}" "$*" >&2
+    usage >&2
+    exit 2
+}
+
+# Color support. The escape sequences stay empty unless coloring is active,
+# so every call site can use them unconditionally.
+C_RESET=""
+C_BOLD=""
+C_RED=""
+C_YELLOW=""
+C_GREEN=""
+C_DIM=""
+
+# Decide whether color is used, based on the resolved color mode and on
+# whether STDOUT is a terminal.
+setup_color() {
+    local enable=0
+    case "${COLOR_MODE}" in
+        always) enable=1 ;;
+        never)  enable=0 ;;
+        auto)   if [ -t 1 ]; then enable=1; fi ;;
+        *)      die_usage "invalid value for --color: ${COLOR_MODE} (expected always, never or auto)" ;;
+    esac
+    # JSON must stay parseable, so it is never colorized.
+    if [ "${JSON_OUTPUT}" -eq 1 ]; then
+        enable=0
+    fi
+    if [ "${enable}" -eq 1 ]; then
+        C_RESET=$'\033[0m'
+        C_BOLD=$'\033[1m'
+        C_RED=$'\033[31m'
+        C_YELLOW=$'\033[33m'
+        C_GREEN=$'\033[32m'
+        C_DIM=$'\033[2m'
+    fi
+}
+
+# Escape a string so it can be used as a JSON string value.
+json_escape() {
+    local s="${1}"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "${s}"
+}
+
+# Emit a JSON key/value pair with a string value. An empty value becomes
+# null, so consumers can distinguish "unknown" from "empty string".
+json_kv() {
+    local key="${1}"
+    local value="${2}"
+    if [ -z "${value}" ]; then
+        printf '"%s": null' "$(json_escape "${key}")"
+    else
+        printf '"%s": "%s"' "$(json_escape "${key}")" "$(json_escape "${value}")"
+    fi
+}
+
+# Emit a JSON key/value pair with a numeric value. Non-numeric or empty
+# input becomes null instead of producing invalid JSON.
+json_kv_num() {
+    local key="${1}"
+    local value="${2}"
+    if [[ "${value}" =~ ^-?[0-9]+$ ]]; then
+        printf '"%s": %s' "$(json_escape "${key}")" "${value}"
+    else
+        printf '"%s": null' "$(json_escape "${key}")"
+    fi
+}
+
+# Emit a JSON array of strings from a comma separated list. An empty list
+# becomes an empty array, never null, so consumers can iterate blindly.
+json_array_from_csv() {
+    local raw="${1}"
+    local -a items=()
+    local item first=1
+
+    if [ -n "${raw}" ]; then
+        IFS=',' read -r -a items <<<"${raw}"
+    fi
+    printf '['
+    if [ "${#items[@]}" -gt 0 ]; then
+        for item in "${items[@]}"; do
+            [ "${first}" -eq 1 ] || printf ', '
+            first=0
+            printf '"%s"' "$(json_escape "${item}")"
+        done
+    fi
+    printf ']'
+}
+
+# ==========================================================================
+# Sysfs access helpers
+# ==========================================================================
+
+# Read a single sysfs attribute. Returns an empty string when the attribute
+# does not exist or cannot be read.
+#
+# STDERR of "cat" is discarded here on purpose: sysfs attributes can vanish
+# or return EIO while a device is being removed, and for a read-only status
+# tool "unknown" is the correct answer for that, not an abort. Every caller
+# treats an empty value as "unknown" and reports it as such.
+sysfs_read() {
+    local path="${1}"
+    if [ -f "${path}" ] && [ -r "${path}" ]; then
+        cat -- "${path}" 2>/dev/null || printf ''
+    else
+        printf ''
+    fi
+}
+
+# Extract the active entry from a sysfs multiple-choice attribute, which
+# marks the current selection with brackets, for example:
+#   "writethrough [writeback] writearound none" -> "writeback"
+sysfs_selected() {
+    local raw="${1}"
+    local -a words=()
+    local word
+    read -r -a words <<<"${raw}"
+    if [ "${#words[@]}" -eq 0 ]; then
+        printf ''
+        return 0
+    fi
+    for word in "${words[@]}"; do
+        if [ "${word#\[}" != "${word}" ]; then
+            word="${word#\[}"
+            word="${word%\]}"
+            printf '%s' "${word}"
+            return 0
+        fi
+    done
+    printf '%s' "${raw}"
+}
+
+# Resolve the target of a sysfs symlink and print its basename. Prints
+# nothing when the link is absent.
+sysfs_link_name() {
+    local path="${1}"
+    local target
+    if [ -L "${path}" ]; then
+        target="$(readlink -f -- "${path}")"
+        printf '%s' "${target##*/}"
+    else
+        printf ''
+    fi
+}
+
+# Translate a kernel device name into the path below /dev. Device mapper
+# devices are reported under their friendly /dev/mapper name.
+dev_path_for() {
+    local kernel_name="${1}"
+    local dm_name
+    dm_name="$(sysfs_read "${SYSFS_ROOT}/block/${kernel_name}/dm/name")"
+    if [ -n "${dm_name}" ]; then
+        printf '/dev/mapper/%s' "${dm_name}"
+    else
+        printf '/dev/%s' "${kernel_name}"
+    fi
+}
+
+# ==========================================================================
+# Stable device names (/dev/disk/by-id)
+# ==========================================================================
+
+declare -A BYID_NAME=()
+declare -A BYID_RANK=()
+
+# Rank a by-id link so the most useful identifier wins when a device has
+# several. Lower is better: hardware identifiers beat generic ones, and
+# device mapper or LVM specific links are the last resort.
+byid_rank() {
+    case "${1}" in
+        ata-*|nvme-*|scsi-*|usb-*|mmc-*|virtio-*) printf '10' ;;
+        md-name-*|md-uuid-*)                      printf '20' ;;
+        wwn-*|nvme-eui.*)                         printf '50' ;;
+        dm-name-*|dm-uuid-*|lvm-pv-uuid-*)        printf '90' ;;
+        *)                                        printf '40' ;;
+    esac
+}
+
+# Build the reverse map kernel name -> preferred by-id name. Only meaningful
+# for the live system, so it is skipped when a captured sysfs tree is used.
+build_byid_map() {
+    local link name target kernel rank previous
+    [ -d /dev/disk/by-id ] || return 0
+    for link in /dev/disk/by-id/*; do
+        [ -e "${link}" ] || continue
+        name="${link##*/}"
+        target="$(readlink -f -- "${link}")" || continue
+        kernel="${target##*/}"
+        rank="$(byid_rank "${name}")"
+        previous="${BYID_RANK[${kernel}]:-999}"
+        if [ "${rank}" -lt "${previous}" ]; then
+            BYID_RANK["${kernel}"]="${rank}"
+            BYID_NAME["${kernel}"]="${name}"
+        fi
+    done
+}
+
+# Look up the stable name of a kernel device, empty when none is known.
+byid_for() {
+    printf '%s' "${BYID_NAME[${1}]:-}"
+}
+
+# ==========================================================================
+# Collected state
+# ==========================================================================
+
+# Backing devices, indexed by position in BDEV_ORDER. Fields are stored as
+# "index|field" keys because bash has no nested data structures.
+declare -A BDEV=()
+declare -a BDEV_ORDER=()
+
+# Cache devices and cache sets, same layout.
+declare -A CDEV=()
+declare -a CDEV_ORDER=()
+declare -A CSET=()
+declare -a CSET_ORDER=()
+
+# Flash-only volumes: bcache block devices without a backing device.
+declare -a FLASH_VOLUMES=()
+
+# Block devices that carry a bcache superblock but are not registered.
+declare -a UNREGISTERED=()
+
+# Set when the unregistered scan could not run, with the reason.
+UNREGISTERED_SKIPPED=""
+
+# True when the tool reads the live system, false for a captured tree. Only
+# then may lsblk, /dev/disk/by-id and /proc/self/mounts be consulted.
+LIVE_SYSTEM=0
+
+# Names of all registered devices, used to spot unregistered superblocks.
+declare -A REGISTERED=()
+
+# Collect one backing device from its sysfs directory.
+collect_backing_device() {
+    local dir="${1}"
+    local idx="${#BDEV_ORDER[@]}"
+    local parent kernel_name cset
+
+    parent="${dir%/bcache}"
+    kernel_name="${parent##*/}"
+
+    BDEV["${idx}|kernel_name"]="${kernel_name}"
+    BDEV["${idx}|dev_path"]="$(dev_path_for "${kernel_name}")"
+    BDEV["${idx}|sysfs"]="${dir}"
+    BDEV["${idx}|bcache_dev"]="$(sysfs_link_name "${dir}/dev")"
+    BDEV["${idx}|running"]="$(sysfs_read "${dir}/running")"
+    BDEV["${idx}|state"]="$(sysfs_read "${dir}/state")"
+    BDEV["${idx}|cache_mode"]="$(sysfs_selected "$(sysfs_read "${dir}/cache_mode")")"
+    BDEV["${idx}|dirty_data"]="$(sysfs_read "${dir}/dirty_data")"
+    BDEV["${idx}|label"]="$(sysfs_read "${dir}/label")"
+    BDEV["${idx}|sequential_cutoff"]="$(sysfs_read "${dir}/sequential_cutoff")"
+    BDEV["${idx}|readahead"]="$(sysfs_read "${dir}/readahead")"
+    BDEV["${idx}|writeback_percent"]="$(sysfs_read "${dir}/writeback_percent")"
+    BDEV["${idx}|writeback_running"]="$(sysfs_read "${dir}/writeback_running")"
+    BDEV["${idx}|writeback_rate"]="$(sysfs_read "${dir}/writeback_rate")"
+    BDEV["${idx}|backing_dev_uuid"]="$(sysfs_read "${dir}/backing_dev_uuid")"
+
+    # The attached cache set is exposed as a symlink into /sys/fs/bcache.
+    # Older kernels name it "cache", some name it "set"; accept both.
+    cset="$(sysfs_link_name "${dir}/cache")"
+    if [ -z "${cset}" ]; then
+        cset="$(sysfs_link_name "${dir}/set")"
+    fi
+    BDEV["${idx}|cache_set"]="${cset}"
+
+    # Per-device hit statistics. The five minute window shows the current
+    # behaviour, the total window shows the long term picture.
+    BDEV["${idx}|hit_ratio_total"]="$(sysfs_read "${dir}/stats_total/cache_hit_ratio")"
+    BDEV["${idx}|hit_ratio_5m"]="$(sysfs_read "${dir}/stats_five_minute/cache_hit_ratio")"
+    BDEV["${idx}|hits_total"]="$(sysfs_read "${dir}/stats_total/cache_hits")"
+    BDEV["${idx}|misses_total"]="$(sysfs_read "${dir}/stats_total/cache_misses")"
+    BDEV["${idx}|bypassed_total"]="$(sysfs_read "${dir}/stats_total/bypassed")"
+
+    BDEV["${idx}|byid"]="$(byid_for "${kernel_name}")"
+    BDEV["${idx}|usage"]=""
+
+    BDEV_ORDER+=("${idx}")
+    REGISTERED["${kernel_name}"]="backing"
+}
+
+# Collect one cache device from its sysfs directory.
+collect_cache_device() {
+    local dir="${1}"
+    local idx="${#CDEV_ORDER[@]}"
+    local parent kernel_name
+
+    parent="${dir%/bcache}"
+    kernel_name="${parent##*/}"
+
+    CDEV["${idx}|kernel_name"]="${kernel_name}"
+    CDEV["${idx}|dev_path"]="$(dev_path_for "${kernel_name}")"
+    CDEV["${idx}|sysfs"]="${dir}"
+    CDEV["${idx}|cache_set"]="$(sysfs_link_name "${dir}/set")"
+    CDEV["${idx}|bucket_size"]="$(sysfs_read "${dir}/bucket_size")"
+    CDEV["${idx}|block_size"]="$(sysfs_read "${dir}/block_size")"
+    CDEV["${idx}|nbuckets"]="$(sysfs_read "${dir}/nbuckets")"
+    CDEV["${idx}|written"]="$(sysfs_read "${dir}/written")"
+    CDEV["${idx}|io_errors"]="$(sysfs_read "${dir}/io_errors")"
+    CDEV["${idx}|discard"]="$(sysfs_read "${dir}/discard")"
+    CDEV["${idx}|replacement"]="$(sysfs_selected "$(sysfs_read "${dir}/cache_replacement_policy")")"
+    CDEV["${idx}|byid"]="$(byid_for "${kernel_name}")"
+
+    CDEV_ORDER+=("${idx}")
+    REGISTERED["${kernel_name}"]="cache"
+}
+
+# Collect one cache set from /sys/fs/bcache/<uuid>.
+collect_cache_set() {
+    local dir="${1}"
+    local idx="${#CSET_ORDER[@]}"
+    local uuid
+
+    uuid="${dir##*/}"
+
+    CSET["${idx}|uuid"]="${uuid}"
+    CSET["${idx}|sysfs"]="${dir}"
+    CSET["${idx}|available_percent"]="$(sysfs_read "${dir}/cache_available_percent")"
+    CSET["${idx}|dirty_data"]="$(sysfs_read "${dir}/dirty_data")"
+    CSET["${idx}|block_size"]="$(sysfs_read "${dir}/block_size")"
+    CSET["${idx}|bucket_size"]="$(sysfs_read "${dir}/bucket_size")"
+    CSET["${idx}|congested"]="$(sysfs_read "${dir}/congested")"
+    CSET["${idx}|error_action"]="$(sysfs_selected "$(sysfs_read "${dir}/errors")")"
+    CSET["${idx}|io_error_limit"]="$(sysfs_read "${dir}/io_error_limit")"
+    CSET["${idx}|synchronous"]="$(sysfs_read "${dir}/synchronous")"
+    CSET["${idx}|hit_ratio_total"]="$(sysfs_read "${dir}/stats_total/cache_hit_ratio")"
+    CSET["${idx}|hit_ratio_5m"]="$(sysfs_read "${dir}/stats_five_minute/cache_hit_ratio")"
+
+    CSET_ORDER+=("${idx}")
+}
+
+# Walk sysfs and collect everything bcache exposes.
+#
+# Registered devices show up as a "bcache" subdirectory below their block
+# device, either directly (whole disk) or one level deeper (partition). The
+# directory below /sys/block/bcacheN is a symlink back to the backing device
+# and is skipped so devices are not counted twice. Backing devices are told
+# apart from cache devices by the attributes they carry.
+collect_state() {
+    local dir parent kernel_name target
+
+    for dir in "${SYSFS_ROOT}"/block/*/bcache "${SYSFS_ROOT}"/block/*/*/bcache; do
+        [ -d "${dir}" ] || continue
+        parent="${dir%/bcache}"
+        kernel_name="${parent##*/}"
+        case "${kernel_name}" in
+            bcache[0-9]*) continue ;;
+        esac
+        if [ -e "${dir}/cache_mode" ]; then
+            collect_backing_device "${dir}"
+        elif [ -e "${dir}/nbuckets" ] || [ -e "${dir}/set" ]; then
+            collect_cache_device "${dir}"
+        fi
+    done
+
+    # Cache sets are the directories below /sys/fs/bcache whose name is a
+    # UUID; the register/pendings_cleanup entries are files, not directories.
+    for dir in "${SYSFS_ROOT}"/fs/bcache/*; do
+        [ -d "${dir}" ] || continue
+        collect_cache_set "${dir}"
+    done
+
+    # Flash-only volumes are bcache block devices whose bcache link does not
+    # point at a backing device.
+    for dir in "${SYSFS_ROOT}"/block/bcache[0-9]*; do
+        [ -d "${dir}" ] || continue
+        [ -e "${dir}/bcache" ] || continue
+        target="$(readlink -f -- "${dir}/bcache")"
+        if [ ! -e "${target}/cache_mode" ]; then
+            FLASH_VOLUMES+=("${dir##*/}")
+        fi
+    done
+}
+
+# Find block devices that carry a bcache superblock but are not registered.
+# This relies on lsblk reading the on-disk signature, so it only works on
+# the live system.
+collect_unregistered() {
+    local line name fstype size
+
+    if [ "${LIVE_SYSTEM}" -ne 1 ]; then
+        UNREGISTERED_SKIPPED="sysfs root is not /sys"
+        return 0
+    fi
+    if ! command -v lsblk >/dev/null 2>&1; then
+        UNREGISTERED_SKIPPED="lsblk is not installed"
+        return 0
+    fi
+
+    while IFS=' ' read -r name fstype size; do
+        [ "${fstype}" = "bcache" ] || continue
+        [ -n "${REGISTERED[${name}]:-}" ] && continue
+        UNREGISTERED+=("${name} ${size}")
+    done < <(lsblk --raw --noheadings --output NAME,FSTYPE,SIZE)
+}
+
+# Describe what sits on top of a bcache device: its own filesystem plus any
+# holders such as LUKS containers or LVM physical volumes, with mount points.
+collect_usage() {
+    local idx bcache_dev line name fstype mountpoint parts
+
+    [ "${LIVE_SYSTEM}" -eq 1 ] || return 0
+    command -v lsblk >/dev/null 2>&1 || return 0
+    [ "${#BDEV_ORDER[@]}" -gt 0 ] || return 0
+
+    for idx in "${BDEV_ORDER[@]}"; do
+        bcache_dev="${BDEV[${idx}|bcache_dev]}"
+        [ -n "${bcache_dev}" ] || continue
+        [ -b "/dev/${bcache_dev}" ] || continue
+        parts=""
+        while IFS=' ' read -r name fstype mountpoint; do
+            # The device itself only matters when it is mounted or formatted;
+            # holders are always worth showing because they explain the stack.
+            if [ -n "${mountpoint}" ]; then
+                parts="${parts}${parts:+, }${mountpoint} (${fstype:-unknown})"
+            elif [ "${name}" != "${bcache_dev}" ] && [ -n "${fstype}" ]; then
+                parts="${parts}${parts:+, }${name}: ${fstype}"
+            elif [ "${name}" = "${bcache_dev}" ] && [ -n "${fstype}" ]; then
+                parts="${parts}${parts:+, }${fstype}"
+            fi
+        done < <(lsblk --raw --noheadings --output NAME,FSTYPE,MOUNTPOINT -- "/dev/${bcache_dev}")
+        BDEV["${idx}|usage"]="${parts}"
+    done
+}
+
+# Return the cache devices of a cache set as a comma separated list of paths.
+cache_devices_of_set() {
+    local uuid="${1}"
+    local idx result=""
+    [ "${#CDEV_ORDER[@]}" -gt 0 ] || { printf ''; return 0; }
+    for idx in "${CDEV_ORDER[@]}"; do
+        if [ "${CDEV[${idx}|cache_set]}" = "${uuid}" ]; then
+            result="${result}${result:+,}${CDEV[${idx}|dev_path]}"
+        fi
+    done
+    printf '%s' "${result}"
+}
+
+# Return the bcache devices backed by a cache set as a comma separated list.
+backing_devices_of_set() {
+    local uuid="${1}"
+    local idx name result=""
+    [ "${#BDEV_ORDER[@]}" -gt 0 ] || { printf ''; return 0; }
+    for idx in "${BDEV_ORDER[@]}"; do
+        if [ "${BDEV[${idx}|cache_set]}" = "${uuid}" ]; then
+            name="${BDEV[${idx}|bcache_dev]}"
+            result="${result}${result:+,}${name:-${BDEV[${idx}|kernel_name]}}"
+        fi
+    done
+    printf '%s' "${result}"
+}
+
+# Return the cache device path attached to a backing device, or an empty
+# string when no cache is attached.
+cache_path_of_backing() {
+    local idx="${1}"
+    local uuid="${BDEV[${idx}|cache_set]}"
+    [ -n "${uuid}" ] || { printf ''; return 0; }
+    printf '%s' "$(cache_devices_of_set "${uuid}")"
+}
+
+# Decide whether a backing device matches the device filter given on the
+# command line. Without a filter every device matches.
+backing_matches_filter() {
+    local idx="${1}"
+    local pattern
+    [ "${#DEVICE_FILTER[@]}" -gt 0 ] || return 0
+    for pattern in "${DEVICE_FILTER[@]}"; do
+        pattern="${pattern#/dev/}"
+        pattern="${pattern#mapper/}"
+        if [ "${pattern}" = "${BDEV[${idx}|kernel_name]}" ] \
+        || [ "${pattern}" = "${BDEV[${idx}|bcache_dev]}" ] \
+        || [ "${pattern}" = "${BDEV[${idx}|byid]}" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ==========================================================================
+# Command: status
+# ==========================================================================
+
+# Render the overview as an aligned table plus, in long mode, one detail
+# block per backing device.
+render_status_human() {
+    local -a c_bcache=() c_backing=() c_cache=() c_mode=() c_state=() c_dirty=() c_hit=() c_usage=()
+    local idx i cache_path state hit
+    local w_bcache=6 w_backing=7 w_cache=5 w_mode=4 w_state=5 w_dirty=5 w_hit=4
+    local shown=0
+
+    if [ "${#BDEV_ORDER[@]}" -gt 0 ]; then
+        for idx in "${BDEV_ORDER[@]}"; do
+            backing_matches_filter "${idx}" || continue
+            shown=$((shown + 1))
+            cache_path="$(cache_path_of_backing "${idx}")"
+            state="${BDEV[${idx}|state]}"
+            hit="${BDEV[${idx}|hit_ratio_total]}"
+            c_bcache+=("${BDEV[${idx}|bcache_dev]:--}")
+            c_backing+=("${BDEV[${idx}|dev_path]}")
+            c_cache+=("${cache_path:--}")
+            c_mode+=("${BDEV[${idx}|cache_mode]:-unknown}")
+            c_state+=("${state:-unknown}")
+            c_dirty+=("${BDEV[${idx}|dirty_data]:--}")
+            c_hit+=("${hit:--}")
+            c_usage+=("${BDEV[${idx}|usage]:--}")
+        done
+    fi
+
+    if [ "${shown}" -eq 0 ]; then
+        if [ "${#DEVICE_FILTER[@]}" -gt 0 ]; then
+            printf 'No bcache backing device matches the given filter.\n'
+        else
+            printf 'No registered bcache backing devices found.\n'
+        fi
+    else
+        # Widen every column to its widest entry so the table stays aligned
+        # regardless of device naming.
+        for i in "${!c_bcache[@]}"; do
+            [ "${#c_bcache[i]}" -gt "${w_bcache}" ] && w_bcache="${#c_bcache[i]}"
+            [ "${#c_backing[i]}" -gt "${w_backing}" ] && w_backing="${#c_backing[i]}"
+            [ "${#c_cache[i]}" -gt "${w_cache}" ] && w_cache="${#c_cache[i]}"
+            [ "${#c_mode[i]}" -gt "${w_mode}" ] && w_mode="${#c_mode[i]}"
+            [ "${#c_state[i]}" -gt "${w_state}" ] && w_state="${#c_state[i]}"
+            [ "${#c_dirty[i]}" -gt "${w_dirty}" ] && w_dirty="${#c_dirty[i]}"
+            [ "${#c_hit[i]}" -gt "${w_hit}" ] && w_hit="${#c_hit[i]}"
+        done
+
+        printf '%s' "${C_BOLD}"
+        printf '%-*s  %-*s  %-*s  %-*s  %-*s  %*s  %*s  %s' \
+            "${w_bcache}" "BCACHE" "${w_backing}" "BACKING" "${w_cache}" "CACHE" \
+            "${w_mode}" "MODE" "${w_state}" "STATE" "${w_dirty}" "DIRTY" \
+            "${w_hit}" "HIT%" "USAGE"
+        printf '%s\n' "${C_RESET}"
+
+        for i in "${!c_bcache[@]}"; do
+            # Highlight the two states an operator must react to: an
+            # uncached backing device and an inconsistent one.
+            local state_colored="${c_state[i]}"
+            case "${c_state[i]}" in
+                "no cache")    state_colored="${C_YELLOW}${c_state[i]}${C_RESET}" ;;
+                inconsistent)  state_colored="${C_RED}${c_state[i]}${C_RESET}" ;;
+                clean)         state_colored="${C_GREEN}${c_state[i]}${C_RESET}" ;;
+            esac
+            printf '%-*s  %-*s  %-*s  %-*s  %-*s  %*s  %*s  %s\n' \
+                "${w_bcache}" "${c_bcache[i]}" \
+                "${w_backing}" "${c_backing[i]}" \
+                "${w_cache}" "${c_cache[i]}" \
+                "${w_mode}" "${c_mode[i]}" \
+                "$((w_state + ${#state_colored} - ${#c_state[i]}))" "${state_colored}" \
+                "${w_dirty}" "${c_dirty[i]}" \
+                "${w_hit}" "${c_hit[i]}" \
+                "${c_usage[i]}"
+        done
+    fi
+
+    render_cache_sets_human
+    render_extras_human
+
+    if [ "${LONG_OUTPUT}" -eq 1 ]; then
+        render_details_human
+    fi
+}
+
+# Print one line per cache set with the numbers that matter day to day.
+render_cache_sets_human() {
+    local idx caches backings avail
+
+    printf '\n%sCACHE SETS%s\n' "${C_BOLD}" "${C_RESET}"
+    if [ "${#CSET_ORDER[@]}" -eq 0 ]; then
+        printf '  none\n'
+        return 0
+    fi
+    for idx in "${CSET_ORDER[@]}"; do
+        caches="$(cache_devices_of_set "${CSET[${idx}|uuid]}")"
+        backings="$(backing_devices_of_set "${CSET[${idx}|uuid]}")"
+        avail="${CSET[${idx}|available_percent]}"
+        printf '  %s\n' "${CSET[${idx}|uuid]}"
+        printf '    cache devices   : %s\n' "${caches:-none}"
+        printf '    backing devices : %s\n' "${backings:-none}"
+        printf '    available       : %s%%   dirty: %s   hit ratio: %s%% total / %s%% 5min\n' \
+            "${avail:-?}" "${CSET[${idx}|dirty_data]:-?}" \
+            "${CSET[${idx}|hit_ratio_total]:-?}" "${CSET[${idx}|hit_ratio_5m]:-?}"
+    done
+}
+
+# Print flash volumes and unregistered devices, both of which are easy to
+# overlook otherwise.
+render_extras_human() {
+    local entry
+
+    if [ "${#FLASH_VOLUMES[@]}" -gt 0 ]; then
+        printf '\n%sFLASH VOLUMES%s\n' "${C_BOLD}" "${C_RESET}"
+        for entry in "${FLASH_VOLUMES[@]}"; do
+            printf '  /dev/%s\n' "${entry}"
+        done
+    fi
+
+    printf '\n%sUNREGISTERED bcache DEVICES%s\n' "${C_BOLD}" "${C_RESET}"
+    if [ -n "${UNREGISTERED_SKIPPED}" ]; then
+        printf '  not checked (%s)\n' "${UNREGISTERED_SKIPPED}"
+    elif [ "${#UNREGISTERED[@]}" -eq 0 ]; then
+        printf '  none\n'
+    else
+        for entry in "${UNREGISTERED[@]}"; do
+            printf '  %s/dev/%s%s\n' "${C_YELLOW}" "${entry% *}" "${C_RESET}"
+        done
+    fi
+}
+
+# Print the full attribute set per backing device, including the stable
+# names and the tunables that are lost on every reboot.
+render_details_human() {
+    local idx
+
+    printf '\n%sDETAILS%s\n' "${C_BOLD}" "${C_RESET}"
+    [ "${#BDEV_ORDER[@]}" -gt 0 ] || { printf '  none\n'; return 0; }
+
+    for idx in "${BDEV_ORDER[@]}"; do
+        backing_matches_filter "${idx}" || continue
+        printf '\n  %s%s%s\n' "${C_BOLD}" "${BDEV[${idx}|bcache_dev]:-(not running)}" "${C_RESET}"
+        printf '    backing device   : %s\n' "${BDEV[${idx}|dev_path]}"
+        printf '    stable name      : %s\n' "${BDEV[${idx}|byid]:-unknown}"
+        printf '    backing dev uuid : %s\n' "${BDEV[${idx}|backing_dev_uuid]:-unknown}"
+        printf '    label            : %s\n' "${BDEV[${idx}|label]:-none}"
+        printf '    cache set        : %s\n' "${BDEV[${idx}|cache_set]:-none attached}"
+        printf '    cache devices    : %s\n' "$(cache_path_of_backing "${idx}")"
+        printf '    cache mode       : %s\n' "${BDEV[${idx}|cache_mode]:-unknown}"
+        printf '    state            : %s\n' "${BDEV[${idx}|state]:-unknown}"
+        printf '    running          : %s\n' "${BDEV[${idx}|running]:-unknown}"
+        printf '    dirty data       : %s\n' "${BDEV[${idx}|dirty_data]:-unknown}"
+        printf '    writeback percent: %s\n' "${BDEV[${idx}|writeback_percent]:-unknown}"
+        printf '    writeback running: %s\n' "${BDEV[${idx}|writeback_running]:-unknown}"
+        printf '    writeback rate   : %s\n' "${BDEV[${idx}|writeback_rate]:-unknown}"
+        printf '    sequential cutoff: %s\n' "${BDEV[${idx}|sequential_cutoff]:-unknown}"
+        printf '    hit ratio        : %s%% total / %s%% 5min\n' \
+            "${BDEV[${idx}|hit_ratio_total]:-?}" "${BDEV[${idx}|hit_ratio_5m]:-?}"
+        printf '    hits / misses    : %s / %s\n' \
+            "${BDEV[${idx}|hits_total]:-?}" "${BDEV[${idx}|misses_total]:-?}"
+        printf '    bypassed         : %s\n' "${BDEV[${idx}|bypassed_total]:-unknown}"
+        printf '    usage            : %s\n' "${BDEV[${idx}|usage]:-unknown}"
+    done
+}
+
+# Render the same information as JSON. The structure is stable and every
+# unknown value is emitted as null.
+render_status_json() {
+    local idx first=1 entry name size
+
+    printf '{\n'
+    printf '  %s,\n' "$(json_kv tool "${SCRIPT_NAME}")"
+    printf '  %s,\n' "$(json_kv version "${SCRIPT_VERSION}")"
+    printf '  %s,\n' "$(json_kv generated "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")"
+    printf '  %s,\n' "$(json_kv sysfs_root "${SYSFS_ROOT}")"
+
+    printf '  "cache_sets": [\n'
+    if [ "${#CSET_ORDER[@]}" -gt 0 ]; then
+        for idx in "${CSET_ORDER[@]}"; do
+            [ "${first}" -eq 1 ] || printf ',\n'
+            first=0
+            printf '    {'
+            printf '%s, ' "$(json_kv uuid "${CSET[${idx}|uuid]}")"
+            printf '%s, ' "$(json_kv_num available_percent "${CSET[${idx}|available_percent]}")"
+            printf '%s, ' "$(json_kv dirty_data "${CSET[${idx}|dirty_data]}")"
+            printf '%s, ' "$(json_kv_num block_size "${CSET[${idx}|block_size]}")"
+            printf '%s, ' "$(json_kv bucket_size "${CSET[${idx}|bucket_size]}")"
+            printf '%s, ' "$(json_kv error_action "${CSET[${idx}|error_action]}")"
+            printf '%s, ' "$(json_kv_num io_error_limit "${CSET[${idx}|io_error_limit]}")"
+            printf '%s, ' "$(json_kv_num hit_ratio_total "${CSET[${idx}|hit_ratio_total]}")"
+            printf '%s, ' "$(json_kv_num hit_ratio_5m "${CSET[${idx}|hit_ratio_5m]}")"
+            printf '"cache_devices": %s, ' "$(json_array_from_csv "$(cache_devices_of_set "${CSET[${idx}|uuid]}")")"
+            printf '"backing_devices": %s' "$(json_array_from_csv "$(backing_devices_of_set "${CSET[${idx}|uuid]}")")"
+            printf '}'
+        done
+        printf '\n'
+    fi
+    printf '  ],\n'
+
+    first=1
+    printf '  "cache_devices": [\n'
+    if [ "${#CDEV_ORDER[@]}" -gt 0 ]; then
+        for idx in "${CDEV_ORDER[@]}"; do
+            [ "${first}" -eq 1 ] || printf ',\n'
+            first=0
+            printf '    {'
+            printf '%s, ' "$(json_kv kernel_name "${CDEV[${idx}|kernel_name]}")"
+            printf '%s, ' "$(json_kv dev_path "${CDEV[${idx}|dev_path]}")"
+            printf '%s, ' "$(json_kv by_id "${CDEV[${idx}|byid]}")"
+            printf '%s, ' "$(json_kv cache_set "${CDEV[${idx}|cache_set]}")"
+            printf '%s, ' "$(json_kv bucket_size "${CDEV[${idx}|bucket_size]}")"
+            printf '%s, ' "$(json_kv_num block_size "${CDEV[${idx}|block_size]}")"
+            printf '%s, ' "$(json_kv_num nbuckets "${CDEV[${idx}|nbuckets]}")"
+            printf '%s, ' "$(json_kv_num io_errors "${CDEV[${idx}|io_errors]}")"
+            printf '%s, ' "$(json_kv_num discard "${CDEV[${idx}|discard]}")"
+            printf '%s' "$(json_kv replacement_policy "${CDEV[${idx}|replacement]}")"
+            printf '}'
+        done
+        printf '\n'
+    fi
+    printf '  ],\n'
+
+    first=1
+    printf '  "backing_devices": [\n'
+    if [ "${#BDEV_ORDER[@]}" -gt 0 ]; then
+        for idx in "${BDEV_ORDER[@]}"; do
+            backing_matches_filter "${idx}" || continue
+            [ "${first}" -eq 1 ] || printf ',\n'
+            first=0
+            printf '    {'
+            printf '%s, ' "$(json_kv bcache_device "${BDEV[${idx}|bcache_dev]}")"
+            printf '%s, ' "$(json_kv kernel_name "${BDEV[${idx}|kernel_name]}")"
+            printf '%s, ' "$(json_kv dev_path "${BDEV[${idx}|dev_path]}")"
+            printf '%s, ' "$(json_kv by_id "${BDEV[${idx}|byid]}")"
+            printf '%s, ' "$(json_kv backing_dev_uuid "${BDEV[${idx}|backing_dev_uuid]}")"
+            printf '%s, ' "$(json_kv label "${BDEV[${idx}|label]}")"
+            printf '%s, ' "$(json_kv cache_set "${BDEV[${idx}|cache_set]}")"
+            printf '"cache_devices": %s, ' "$(json_array_from_csv "$(cache_path_of_backing "${idx}")")"
+            printf '%s, ' "$(json_kv cache_mode "${BDEV[${idx}|cache_mode]}")"
+            printf '%s, ' "$(json_kv state "${BDEV[${idx}|state]}")"
+            printf '%s, ' "$(json_kv_num running "${BDEV[${idx}|running]}")"
+            printf '%s, ' "$(json_kv dirty_data "${BDEV[${idx}|dirty_data]}")"
+            printf '%s, ' "$(json_kv_num writeback_percent "${BDEV[${idx}|writeback_percent]}")"
+            printf '%s, ' "$(json_kv_num writeback_running "${BDEV[${idx}|writeback_running]}")"
+            printf '%s, ' "$(json_kv_num writeback_rate "${BDEV[${idx}|writeback_rate]}")"
+            printf '%s, ' "$(json_kv sequential_cutoff "${BDEV[${idx}|sequential_cutoff]}")"
+            printf '%s, ' "$(json_kv_num hit_ratio_total "${BDEV[${idx}|hit_ratio_total]}")"
+            printf '%s, ' "$(json_kv_num hit_ratio_5m "${BDEV[${idx}|hit_ratio_5m]}")"
+            printf '%s, ' "$(json_kv_num cache_hits "${BDEV[${idx}|hits_total]}")"
+            printf '%s, ' "$(json_kv_num cache_misses "${BDEV[${idx}|misses_total]}")"
+            printf '%s, ' "$(json_kv bypassed "${BDEV[${idx}|bypassed_total]}")"
+            printf '%s' "$(json_kv usage "${BDEV[${idx}|usage]}")"
+            printf '}'
+        done
+        printf '\n'
+    fi
+    printf '  ],\n'
+
+    first=1
+    printf '  "flash_volumes": ['
+    if [ "${#FLASH_VOLUMES[@]}" -gt 0 ]; then
+        for entry in "${FLASH_VOLUMES[@]}"; do
+            [ "${first}" -eq 1 ] || printf ', '
+            first=0
+            printf '"%s"' "$(json_escape "/dev/${entry}")"
+        done
+    fi
+    printf '],\n'
+
+    first=1
+    printf '  "unregistered_devices": [\n'
+    if [ "${#UNREGISTERED[@]}" -gt 0 ]; then
+        for entry in "${UNREGISTERED[@]}"; do
+            name="${entry% *}"
+            size="${entry##* }"
+            [ "${first}" -eq 1 ] || printf ',\n'
+            first=0
+            printf '    {%s, %s}' "$(json_kv dev_path "/dev/${name}")" "$(json_kv size "${size}")"
+        done
+        printf '\n'
+    fi
+    printf '  ],\n'
+    printf '  %s\n' "$(json_kv unregistered_scan_skipped "${UNREGISTERED_SKIPPED}")"
+    printf '}\n'
+}
+
+# Entry point for the status command.
+cmd_status() {
+    if [ "${JSON_OUTPUT}" -eq 1 ]; then
+        render_status_json
+    else
+        render_status_human
+    fi
+    return 0
+}
+
+# ==========================================================================
+# Command: doctor
+# ==========================================================================
+
+declare -a F_CHECK=()
+declare -a F_LEVEL=()
+declare -a F_DEVICE=()
+declare -a F_MESSAGE=()
+CHECK_MARK=0
+
+# Record one finding. LEVEL is one of ok, warn, crit, unknown.
+add_finding() {
+    F_CHECK+=("${1}")
+    F_LEVEL+=("${2}")
+    F_DEVICE+=("${3}")
+    F_MESSAGE+=("${4}")
+}
+
+# Remember how many findings existed before a check ran, so check_done() can
+# tell whether the check found anything.
+check_start() {
+    CHECK_MARK="${#F_CHECK[@]}"
+}
+
+# Close a check: when it produced no finding, record an explicit OK so the
+# output shows which checks actually ran.
+check_done() {
+    if [ "${#F_CHECK[@]}" -eq "${CHECK_MARK}" ]; then
+        add_finding "${1}" ok "" "${2}"
+    fi
+}
+
+# The bcache sysfs interface must exist at all; without it nothing else can
+# be checked meaningfully.
+check_module() {
+    check_start
+    if [ ! -d "${SYSFS_ROOT}/fs/bcache" ]; then
+        add_finding module crit "" \
+            "bcache sysfs interface is missing at ${SYSFS_ROOT}/fs/bcache; the bcache module is not loaded or not available in this kernel"
+    fi
+    check_done module "bcache sysfs interface is present"
+}
+
+# bcache-tools is needed for every operation beyond reading state.
+check_tools() {
+    local -a missing=()
+    check_start
+    if [ "${LIVE_SYSTEM}" -eq 1 ]; then
+        command -v make-bcache >/dev/null 2>&1 || missing+=("make-bcache")
+        command -v bcache-super-show >/dev/null 2>&1 || missing+=("bcache-super-show")
+        if [ "${#missing[@]}" -gt 0 ]; then
+            add_finding tools warn "" \
+                "bcache-tools is incomplete or not installed; missing: ${missing[*]}"
+        fi
+    else
+        add_finding tools unknown "" "not checked: sysfs root is not /sys"
+    fi
+    check_done tools "bcache-tools is installed"
+}
+
+# A backing device that runs without a cache silently loses all caching. This
+# is the single most common bcache problem after a reboot.
+check_backing_attached() {
+    local idx
+    check_start
+    if [ "${#BDEV_ORDER[@]}" -gt 0 ]; then
+        for idx in "${BDEV_ORDER[@]}"; do
+            # Devices that are not running at all are reported by the
+            # backing-running check; do not report them twice.
+            [ -n "${BDEV[${idx}|bcache_dev]}" ] || continue
+            if [ -z "${BDEV[${idx}|cache_set]}" ]; then
+                add_finding backing-attached warn "${BDEV[${idx}|bcache_dev]:-${BDEV[${idx}|kernel_name]}}" \
+                    "backing device ${BDEV[${idx}|dev_path]} has no cache set attached; it is running uncached"
+            fi
+        done
+    fi
+    check_done backing-attached "every backing device has a cache set attached"
+}
+
+# A registered backing device that is not running usually waits for a cache
+# set that never showed up, so no /dev/bcacheN exists for it.
+check_backing_running() {
+    local idx
+    check_start
+    if [ "${#BDEV_ORDER[@]}" -gt 0 ]; then
+        for idx in "${BDEV_ORDER[@]}"; do
+            if [ -z "${BDEV[${idx}|bcache_dev]}" ] || [ "${BDEV[${idx}|running]}" = "0" ]; then
+                add_finding backing-running crit "${BDEV[${idx}|kernel_name]}" \
+                    "backing device ${BDEV[${idx}|dev_path]} is registered but not running; it is most likely waiting for cache set ${BDEV[${idx}|cache_set]:-<unknown>}"
+            fi
+        done
+    fi
+    check_done backing-running "every registered backing device is running"
+}
+
+# The bcache state attribute reports inconsistency after an unclean cache
+# loss; that is data at risk and must never be ignored.
+check_backing_state() {
+    local idx state
+    check_start
+    if [ "${#BDEV_ORDER[@]}" -gt 0 ]; then
+        for idx in "${BDEV_ORDER[@]}"; do
+            state="${BDEV[${idx}|state]}"
+            if [ "${state}" = "inconsistent" ]; then
+                add_finding backing-state crit "${BDEV[${idx}|bcache_dev]:-${BDEV[${idx}|kernel_name]}}" \
+                    "backing device ${BDEV[${idx}|dev_path]} is in state 'inconsistent'; its cache was lost while it held dirty data"
+            fi
+        done
+    fi
+    check_done backing-state "no backing device reports an inconsistent state"
+}
+
+# Dirty data can only be flushed while writeback is running. Dirty data plus
+# stopped writeback means the data stays on the cache device indefinitely.
+check_writeback() {
+    local idx dirty
+    check_start
+    if [ "${#BDEV_ORDER[@]}" -gt 0 ]; then
+        for idx in "${BDEV_ORDER[@]}"; do
+            dirty="${BDEV[${idx}|dirty_data]}"
+            [ -n "${dirty}" ] || continue
+            # dirty_data is formatted by the kernel, for example "0.0k" or
+            # "3.2G"; anything that is not a plain zero counts as dirty.
+            case "${dirty}" in
+                0|0.0k|0.0K|0k|0K|0.0) continue ;;
+            esac
+            if [ "${BDEV[${idx}|writeback_running]}" = "0" ]; then
+                add_finding writeback crit "${BDEV[${idx}|bcache_dev]:-${BDEV[${idx}|kernel_name]}}" \
+                    "backing device ${BDEV[${idx}|dev_path]} holds ${dirty} of dirty data but writeback_running is 0; the data will not be flushed to disk"
+            fi
+        done
+    fi
+    check_done writeback "writeback is running wherever dirty data exists"
+}
+
+# A cache set without backing devices is an orphan: it occupies an SSD but
+# caches nothing.
+check_cache_set_used() {
+    local idx
+    check_start
+    if [ "${#CSET_ORDER[@]}" -gt 0 ]; then
+        for idx in "${CSET_ORDER[@]}"; do
+            if [ -z "$(backing_devices_of_set "${CSET[${idx}|uuid]}")" ]; then
+                add_finding cache-set-used warn "${CSET[${idx}|uuid]}" \
+                    "cache set ${CSET[${idx}|uuid]} has no backing device attached; the cache device is unused"
+            fi
+        done
+    fi
+    check_done cache-set-used "every cache set has at least one backing device"
+}
+
+# Low available cache space means the cache is almost entirely dirty and can
+# no longer absorb new writes.
+check_cache_available() {
+    local idx avail
+    check_start
+    if [ "${#CSET_ORDER[@]}" -gt 0 ]; then
+        for idx in "${CSET_ORDER[@]}"; do
+            avail="${CSET[${idx}|available_percent]}"
+            [[ "${avail}" =~ ^[0-9]+$ ]] || continue
+            if [ "${avail}" -lt "${MIN_AVAILABLE}" ]; then
+                add_finding cache-available warn "${CSET[${idx}|uuid]}" \
+                    "cache set ${CSET[${idx}|uuid]} reports only ${avail}% available cache space (threshold ${MIN_AVAILABLE}%)"
+            fi
+        done
+    fi
+    check_done cache-available "all cache sets have at least ${MIN_AVAILABLE}% available cache space"
+}
+
+# I/O errors on a cache device precede a failing SSD; bcache disables the
+# cache once io_error_limit is reached.
+check_cache_errors() {
+    local idx errors
+    check_start
+    if [ "${#CDEV_ORDER[@]}" -gt 0 ]; then
+        for idx in "${CDEV_ORDER[@]}"; do
+            errors="${CDEV[${idx}|io_errors]}"
+            [[ "${errors}" =~ ^[0-9]+$ ]] || continue
+            if [ "${errors}" -gt 0 ]; then
+                add_finding cache-errors crit "${CDEV[${idx}|kernel_name]}" \
+                    "cache device ${CDEV[${idx}|dev_path]} reports ${errors} I/O errors"
+            fi
+        done
+    fi
+    check_done cache-errors "no cache device reports I/O errors"
+}
+
+# A device carrying a bcache superblock that is not registered is invisible
+# to the kernel; its data is simply not in use.
+check_unregistered() {
+    local entry
+    check_start
+    if [ -n "${UNREGISTERED_SKIPPED}" ]; then
+        add_finding unregistered unknown "" "not checked: ${UNREGISTERED_SKIPPED}"
+    elif [ "${#UNREGISTERED[@]}" -gt 0 ]; then
+        for entry in "${UNREGISTERED[@]}"; do
+            add_finding unregistered warn "${entry% *}" \
+                "/dev/${entry% *} carries a bcache superblock but is not registered with the kernel"
+        done
+    fi
+    check_done unregistered "no unregistered bcache superblocks found"
+}
+
+# Without the udev rule shipped by bcache-tools, devices are not registered
+# automatically and the setup comes up degraded after a reboot.
+check_udev_rule() {
+    local -a candidates=()
+
+    if [ "${LIVE_SYSTEM}" -ne 1 ]; then
+        add_finding udev-rule unknown "" "not checked: sysfs root is not /sys"
+        return 0
+    fi
+
+    candidates=(/lib/udev/rules.d/*bcache*.rules /usr/lib/udev/rules.d/*bcache*.rules /etc/udev/rules.d/*bcache*.rules)
+    if [ "${#candidates[@]}" -gt 0 ]; then
+        add_finding udev-rule ok "" "a bcache udev rule is installed: ${candidates[0]}"
+    elif [ "${#BDEV_ORDER[@]}" -gt 0 ] || [ "${#CDEV_ORDER[@]}" -gt 0 ]; then
+        add_finding udev-rule warn "" \
+            "no bcache udev rule found below /lib, /usr/lib or /etc; registered devices may not come back automatically after a reboot"
+    else
+        add_finding udev-rule ok "" "no bcache udev rule installed, but no bcache device is present either"
+    fi
+}
+
+# Run all checks in a fixed order, cheapest and most fundamental first.
+run_checks() {
+    check_module
+    check_tools
+
+    # Without the bcache interface there is no device state to inspect.
+    # Reporting the remaining checks as "ok" would be misleading, so they are
+    # skipped with an explicit note instead.
+    if [ ! -d "${SYSFS_ROOT}/fs/bcache" ]; then
+        add_finding device-checks unknown "" \
+            "device checks skipped because the bcache interface is unavailable"
+        return 0
+    fi
+
+    check_backing_running
+    check_backing_attached
+    check_backing_state
+    check_writeback
+    check_cache_set_used
+    check_cache_available
+    check_cache_errors
+    check_unregistered
+    check_udev_rule
+}
+
+# Render the findings as text, grouped by severity via a leading tag.
+render_doctor_human() {
+    local i level tag color
+    local n_ok=0 n_warn=0 n_crit=0 n_unknown=0
+
+    printf '%sbcache health check%s\n\n' "${C_BOLD}" "${C_RESET}"
+    for i in "${!F_CHECK[@]}"; do
+        level="${F_LEVEL[i]}"
+        case "${level}" in
+            ok)      tag="OK      "; color="${C_GREEN}";  n_ok=$((n_ok + 1)) ;;
+            warn)    tag="WARNING "; color="${C_YELLOW}"; n_warn=$((n_warn + 1)) ;;
+            crit)    tag="CRITICAL"; color="${C_RED}";    n_crit=$((n_crit + 1)) ;;
+            *)       tag="UNKNOWN "; color="${C_DIM}";    n_unknown=$((n_unknown + 1)) ;;
+        esac
+        printf '%s%s%s  %-18s %s' "${color}" "${tag}" "${C_RESET}" "${F_CHECK[i]}" "${F_MESSAGE[i]}"
+        if [ -n "${F_DEVICE[i]}" ]; then
+            printf ' %s[%s]%s' "${C_DIM}" "${F_DEVICE[i]}" "${C_RESET}"
+        fi
+        printf '\n'
+    done
+
+    printf '\n%d ok, %d warning(s), %d critical, %d not checked\n' \
+        "${n_ok}" "${n_warn}" "${n_crit}" "${n_unknown}"
+}
+
+# Render the findings as JSON, including a summary block for monitoring.
+render_doctor_json() {
+    local i first=1 status
+    local n_ok=0 n_warn=0 n_crit=0 n_unknown=0
+
+    for i in "${!F_LEVEL[@]}"; do
+        case "${F_LEVEL[i]}" in
+            ok)   n_ok=$((n_ok + 1)) ;;
+            warn) n_warn=$((n_warn + 1)) ;;
+            crit) n_crit=$((n_crit + 1)) ;;
+            *)    n_unknown=$((n_unknown + 1)) ;;
+        esac
+    done
+    status="ok"
+    if [ "${n_crit}" -gt 0 ]; then
+        status="critical"
+    elif [ "${n_warn}" -gt 0 ]; then
+        status="warning"
+    fi
+
+    printf '{\n'
+    printf '  %s,\n' "$(json_kv tool "${SCRIPT_NAME}")"
+    printf '  %s,\n' "$(json_kv version "${SCRIPT_VERSION}")"
+    printf '  %s,\n' "$(json_kv generated "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")"
+    printf '  "summary": {%s, %s, %s, %s, %s},\n' \
+        "$(json_kv status "${status}")" \
+        "$(json_kv_num ok "${n_ok}")" \
+        "$(json_kv_num warning "${n_warn}")" \
+        "$(json_kv_num critical "${n_crit}")" \
+        "$(json_kv_num unknown "${n_unknown}")"
+    printf '  "findings": [\n'
+    for i in "${!F_CHECK[@]}"; do
+        [ "${first}" -eq 1 ] || printf ',\n'
+        first=0
+        printf '    {%s, %s, %s, %s}' \
+            "$(json_kv check "${F_CHECK[i]}")" \
+            "$(json_kv level "${F_LEVEL[i]}")" \
+            "$(json_kv device "${F_DEVICE[i]}")" \
+            "$(json_kv message "${F_MESSAGE[i]}")"
+    done
+    [ "${first}" -eq 1 ] || printf '\n'
+    printf '  ]\n'
+    printf '}\n'
+}
+
+# Entry point for the doctor command. Returns non-zero when at least one
+# warning or critical finding was recorded, so the command can be used as a
+# plain pass/fail check.
+cmd_doctor() {
+    local i rc=0
+
+    run_checks
+
+    if [ "${JSON_OUTPUT}" -eq 1 ]; then
+        render_doctor_json
+    else
+        render_doctor_human
+    fi
+
+    for i in "${!F_LEVEL[@]}"; do
+        case "${F_LEVEL[i]}" in
+            warn|crit) rc=1 ;;
+        esac
+    done
+    return "${rc}"
+}
+
+# ==========================================================================
+# Argument parsing
+# ==========================================================================
+
+while [ "$#" -gt 0 ]; do
+    case "${1}" in
+        -j|--json)
+            JSON_OUTPUT=1
+            shift
+            ;;
+        -l|--long)
+            LONG_OUTPUT=1
+            shift
+            ;;
+        -m|--min-available)
+            if [ "$#" -lt 2 ]; then
+                die_usage "option ${1} requires an argument"
+            fi
+            MIN_AVAILABLE="${2}"
+            shift 2
+            ;;
+        --min-available=*)
+            MIN_AVAILABLE="${1#*=}"
+            shift
+            ;;
+        -r|--sysfs-root)
+            if [ "$#" -lt 2 ]; then
+                die_usage "option ${1} requires an argument"
+            fi
+            SYSFS_ROOT="${2}"
+            shift 2
+            ;;
+        --sysfs-root=*)
+            SYSFS_ROOT="${1#*=}"
+            shift
+            ;;
+        --color)
+            if [ "$#" -lt 2 ]; then
+                die_usage "option ${1} requires an argument"
+            fi
+            COLOR_MODE="${2}"
+            shift 2
+            ;;
+        --color=*)
+            COLOR_MODE="${1#*=}"
+            shift
+            ;;
+        --no-color)
+            COLOR_MODE="never"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -V|--version)
+            printf '%s %s\n' "${SCRIPT_NAME}" "${SCRIPT_VERSION}"
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            die_usage "unknown option: ${1}"
+            ;;
+        *)
+            # The first positional argument is the command, everything after
+            # it is a device filter.
+            if [ -z "${COMMAND}" ]; then
+                COMMAND="${1}"
+            else
+                DEVICE_FILTER+=("${1}")
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Remaining arguments after "--" are device filters as well.
+while [ "$#" -gt 0 ]; do
+    if [ -z "${COMMAND}" ]; then
+        COMMAND="${1}"
+    else
+        DEVICE_FILTER+=("${1}")
+    fi
+    shift
+done
+
+# ==========================================================================
+# Main
+# ==========================================================================
+
+main() {
+    # Validate the resolved configuration before touching any device.
+    case "${JSON_OUTPUT}" in
+        0|1) ;;
+        *) die_usage "invalid value for --json / BCACHEMGMT_JSON: ${JSON_OUTPUT} (expected 0 or 1)" ;;
+    esac
+    case "${LONG_OUTPUT}" in
+        0|1) ;;
+        *) die_usage "invalid value for --long / BCACHEMGMT_LONG: ${LONG_OUTPUT} (expected 0 or 1)" ;;
+    esac
+    if ! [[ "${MIN_AVAILABLE}" =~ ^[0-9]+$ ]] || [ "${MIN_AVAILABLE}" -gt 100 ]; then
+        die_usage "invalid value for --min-available / BCACHEMGMT_MIN_AVAILABLE: ${MIN_AVAILABLE} (expected 0 to 100)"
+    fi
+    SYSFS_ROOT="${SYSFS_ROOT%/}"
+    [ -n "${SYSFS_ROOT}" ] && [ -d "${SYSFS_ROOT}" ] || die "sysfs root does not exist: ${SYSFS_ROOT}"
+    if [ "${SYSFS_ROOT}" = "/sys" ]; then
+        LIVE_SYSTEM=1
+    fi
+
+    setup_color
+
+    if [ -z "${COMMAND}" ]; then
+        die_usage "no command given"
+    fi
+
+    case "${COMMAND}" in
+        help)
+            usage
+            exit 0
+            ;;
+        version)
+            printf '%s %s\n' "${SCRIPT_NAME}" "${SCRIPT_VERSION}"
+            exit 0
+            ;;
+        status|doctor) ;;
+        *)
+            die_usage "unknown command: ${COMMAND}"
+            ;;
+    esac
+
+    # The bcache interface is a hard requirement for status; doctor reports
+    # its absence as a finding instead, so it stays usable for diagnosis.
+    if [ "${COMMAND}" = "status" ] && [ ! -d "${SYSFS_ROOT}/fs/bcache" ]; then
+        die "bcache sysfs interface not found at ${SYSFS_ROOT}/fs/bcache; is the bcache module loaded?"
+    fi
+
+    # Collect everything once; both commands work on the same snapshot.
+    if [ "${LIVE_SYSTEM}" -eq 1 ]; then
+        build_byid_map
+    fi
+    collect_state
+    collect_unregistered
+    collect_usage
+
+    case "${COMMAND}" in
+        status) cmd_status ;;
+        doctor) cmd_doctor ;;
+    esac
+}
+
+main
