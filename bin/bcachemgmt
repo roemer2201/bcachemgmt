@@ -3,93 +3,212 @@
 # bcachemgmt
 #
 # Description:
-#   Read-only management front end for Linux bcache setups. It collects the
-#   state of all registered bcache devices from sysfs and presents it either
-#   as a compact human readable overview ("status") or as a list of health
-#   check findings ("doctor"). Both commands can emit JSON so the output can
-#   be consumed by monitoring or configuration management.
+#   Management front end for Linux bcache setups. It collects the state of all
+#   registered bcache devices from sysfs and lets an operator report on it,
+#   keep it in sync with a declarative configuration file and perform the
+#   runtime and setup operations that bcache otherwise only exposes as raw
+#   sysfs writes.
 #
-#   The tool never writes to sysfs and never modifies a device. It is safe to
-#   run at any time, including on production systems.
+#   The reporting commands (status, doctor, diff) never write to a device and
+#   are safe to run at any time, including on production systems. Every
+#   command that does change something supports a dry run, asks for
+#   confirmation before a destructive step and records what it changed in
+#   syslog, so a change made from cron or a script leaves a trace.
 #
 # Program flow:
-#   1. Parse arguments and resolve configuration (CLI > env > default).
+#   1. Parse arguments and resolve configuration
+#      (CLI > environment > configuration file > built-in default).
 #   2. Verify prerequisites (bcache sysfs interface, optional helper tools).
 #   3. Collect state from sysfs: cache sets, cache devices, backing devices,
 #      flash volumes and block devices carrying an unregistered superblock.
 #   4. Enrich the collected data with stable names (/dev/disk/by-id) and with
 #      filesystem usage information (lsblk).
 #   5. Run the requested command:
-#        status -> render the overview (table or JSON)
-#        doctor -> run the health checks and render the findings
+#        status   -> render the overview (table or JSON)
+#        doctor   -> run the health checks and render the findings
+#        diff     -> compare the configured desired state against reality
+#        apply    -> write the desired state to sysfs
+#        flush    -> force writeback of dirty data and wait for it
+#        attach   -> attach backing devices to a cache set
+#        detach   -> detach backing devices from their cache set
+#        stop     -> stop a backing device or a whole cache set
+#        make     -> guarded make-bcache wrapper for new devices
+#        replace  -> guided replacement of a cache device
 #   6. Exit 0 when there is nothing to report, non-zero on findings or errors.
 #
 # Usage:
-#   bcachemgmt status [-l] [-j] [DEVICE ...]
-#   bcachemgmt doctor [-j] [-m PERCENT]
+#   bcachemgmt status  [-l] [-j] [DEVICE ...]
+#   bcachemgmt doctor  [-j] [-m PERCENT]
+#   bcachemgmt diff    [-j] [DEVICE ...]
+#   bcachemgmt apply   [-n] [DEVICE ...]
+#   bcachemgmt flush   [-n] [-t SECONDS] DEVICE ...
+#   bcachemgmt attach  [-n] [-c CACHE] DEVICE ...
+#   bcachemgmt detach  [-n] [-y] [-t SECONDS] DEVICE ...
+#   bcachemgmt stop    [-n] [-y] [-f] TARGET ...
+#   bcachemgmt make    [-n] [-y] -B DEV ... [-C DEV ...]
+#   bcachemgmt replace [-n] [-y] --cache-set UUID --new DEV
+#   bcachemgmt help | version
 #
 # Requirements:
-#   bash 4.2 or newer, a kernel with bcache support. "lsblk" is optional and
-#   only used to detect unregistered devices and to show filesystem usage.
+#   bash 4.2 or newer, a kernel with bcache support. "lsblk" is optional for
+#   reporting and required for the guards of "make". "bcache-tools" is
+#   required for "make" and "replace" only.
 #
-# Version: 1.0.0  (2026-08-26)
+# Version: 1.1.0  (2026-08-27)
 
 # Robustness baseline. Sysfs reads that are allowed to fail are handled
 # explicitly inside sysfs_read().
 set -euo pipefail
+
+# Every state array below is declared with "declare -g". At the top level
+# that is a no-op, but it keeps the declarations global when the script is
+# sourced from inside a function, which is how the test suite gets at the
+# individual functions. Without it the arrays would silently become locals
+# of the sourcing function and vanish on return.
 
 # Globs that match nothing must expand to nothing, not to the pattern itself.
 # The whole sysfs walk below relies on this.
 shopt -s nullglob
 
 SCRIPT_NAME="$(basename -- "${0}")"
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 
-# --- Defaults seeded from environment variables ---------------------------
-# Precedence: command-line argument > environment variable > built-in default.
-SYSFS_ROOT="${BCACHEMGMT_SYSFS_ROOT:-/sys}"
-JSON_OUTPUT="${BCACHEMGMT_JSON:-0}"
-LONG_OUTPUT="${BCACHEMGMT_LONG:-0}"
-COLOR_MODE="${BCACHEMGMT_COLOR:-auto}"
-MIN_AVAILABLE="${BCACHEMGMT_MIN_AVAILABLE:-10}"
+# Name of the configuration file this script understands. Defined here so it
+# is easy to find and change.
+CONFIG_NAME="bcachemgmt.conf"
+
+# --- Layer 0: built-in defaults -------------------------------------------
+# The effective values are resolved further down, after the configuration
+# file has been read and the command line has been parsed. Precedence:
+# command-line argument > environment variable > configuration file >
+# built-in default.
+DEFAULT_SYSFS_ROOT="/sys"
+DEFAULT_JSON="0"
+DEFAULT_LONG="0"
+DEFAULT_VERBOSE="0"
+DEFAULT_COLOR="auto"
+DEFAULT_MIN_AVAILABLE="10"
+DEFAULT_TIMEOUT="300"
+DEFAULT_DRY_RUN="0"
+DEFAULT_YES="0"
+DEFAULT_FORCE="0"
+DEFAULT_REGISTER="1"
+DEFAULT_WIPE="0"
+
+# Effective settings. Filled by resolve_settings() before any work is done.
+SYSFS_ROOT="${DEFAULT_SYSFS_ROOT}"
+JSON_OUTPUT="${DEFAULT_JSON}"
+LONG_OUTPUT="${DEFAULT_LONG}"
+VERBOSE="${BCACHEMGMT_VERBOSE:-${DEFAULT_VERBOSE}}"
+COLOR_MODE="${DEFAULT_COLOR}"
+MIN_AVAILABLE="${DEFAULT_MIN_AVAILABLE}"
+TIMEOUT="${DEFAULT_TIMEOUT}"
+DRY_RUN="${DEFAULT_DRY_RUN}"
+
+# Settings without a configuration-file layer. For these, seeding from the
+# environment here and letting the command line overwrite them below is
+# already the complete precedence.
+#
+# --yes and --force are among them on purpose: a configuration file that
+# silently disarms the confirmation prompts would defeat the guards of every
+# destructive command, so they can only come from the caller.
+ASSUME_YES="${BCACHEMGMT_YES:-${DEFAULT_YES}}"
+FORCE="${BCACHEMGMT_FORCE:-${DEFAULT_FORCE}}"
+DO_REGISTER="${BCACHEMGMT_REGISTER:-${DEFAULT_REGISTER}}"
+DO_WIPE="${BCACHEMGMT_WIPE:-${DEFAULT_WIPE}}"
+CACHE_TARGET="${BCACHEMGMT_CACHE:-}"
+CACHE_SET_TARGET="${BCACHEMGMT_CACHE_SET:-}"
+NEW_CACHE_DEVICE="${BCACHEMGMT_NEW_CACHE:-}"
+CACHE_MODE_ARG="${BCACHEMGMT_CACHE_MODE:-}"
+BUCKET_SIZE="${BCACHEMGMT_BUCKET_SIZE:-}"
+BLOCK_SIZE="${BCACHEMGMT_BLOCK_SIZE:-}"
+
+# The list valued options. Their environment variables are comma separated
+# and are read in main(), so a -B/-C on the command line takes precedence
+# over them as a whole instead of being mixed with them.
+declare -ga MAKE_BACKING=()
+declare -ga MAKE_CACHE=()
 
 COMMAND=""
-declare -a DEVICE_FILTER=()
+declare -ga DEVICE_FILTER=()
+
+# Path of the configuration file that was actually loaded, for diagnostics.
+CONFIG_LOADED=""
+
+# Set to 1 while a command that modifies devices is running. It switches the
+# syslog trail on: reporting commands stay silent in the system log, changes
+# and the errors that abort them do not.
+WRITE_COMMAND=0
+
+# --- Command-line holders -------------------------------------------------
+# The command line is parsed into these before the layers are merged, so a
+# value given on the command line can win over the configuration file even
+# though the file is read first. Empty means "not given".
+CLI_SYSFS_ROOT=""
+CLI_JSON=""
+CLI_LONG=""
+CLI_VERBOSE=""
+CLI_COLOR=""
+CLI_MIN_AVAILABLE=""
+CLI_TIMEOUT=""
+CLI_DRY_RUN=""
+CLI_CONFIG=""
 
 # ==========================================================================
 # Help
 # ==========================================================================
 
-# Print usage information to STDOUT.
+# Print usage information to STDOUT. Every option is listed together with its
+# environment variable, so the mapping stays visible.
 usage() {
     cat <<'EOF'
-Usage: bcachemgmt COMMAND [OPTIONS] [DEVICE ...]
+Usage: bcachemgmt COMMAND [OPTIONS] [ARGUMENT ...]
 
-Read-only overview and health check for bcache setups. The tool only reads
-sysfs; it never attaches, detaches, stops or formats a device.
+Overview, health check, desired-state configuration and guarded runtime
+operations for bcache setups.
 
-Commands:
+Reporting commands (read-only):
   status            Show an overview of all bcache devices, their backing
                     devices, caches, cache mode and state.
   doctor            Run health checks and report everything that looks wrong.
+  diff              Compare the desired state from the configuration file
+                    against the running state and show the drift.
   help              Show this help and exit.
   version           Show the version and exit.
 
-Arguments:
-  DEVICE            Optional filter for "status". Matches the bcache device
-                    name (bcache0), the backing device name (sdb1) or a
-                    device path (/dev/sdb1). May be given more than once.
+Changing commands (every one of them supports --dry-run):
+  apply             Write the desired state from the configuration file to
+                    sysfs. Only attributes that actually differ are written.
+  flush DEVICE ...  Force writeback of all dirty data of a backing device and
+                    wait until the cache is clean again.
+  attach DEVICE ... Attach backing devices to a cache set (--cache).
+  detach DEVICE ... Detach backing devices from their cache set. bcache
+                    flushes the dirty data first; the command waits for it.
+  stop TARGET ...   Stop a backing device or a whole cache set. Refuses to
+                    act on a mounted or dirty device unless --force is given.
+  make              Create backing (-B) and cache (-C) devices with
+                    make-bcache after checking that they are really unused.
+  replace           Replace the cache device of a cache set: flush, detach,
+                    stop the old set, create the new one and re-attach.
 
-Options:
-  -j, --json        Emit machine readable JSON instead of text.
+Arguments:
+  DEVICE            A backing device, given as the bcache device name
+                    (bcache0), the kernel name (sdb1), a device path
+                    (/dev/sdb1), a /dev/disk/by-id name or the backing device
+                    UUID. For "status", "diff" and "apply" it acts as a
+                    filter and may be omitted to address every device.
+  TARGET            For "stop": a DEVICE as above, or a cache set UUID.
+
+General options:
+  -j, --json        Emit machine readable JSON instead of text. Supported by
+                    status, doctor, diff and apply.
                     Env: BCACHEMGMT_JSON           Default: 0
   -l, --long        "status" only: print a detail block per device in
                     addition to the overview table.
                     Env: BCACHEMGMT_LONG           Default: 0
-  -m, --min-available PERCENT
-                    "doctor" only: warn when a cache set reports less than
-                    PERCENT available cache space.
-                    Env: BCACHEMGMT_MIN_AVAILABLE  Default: 10
+  -v, --verbose     Print additional detail, including every single sysfs
+                    write a changing command performs.
+                    Env: BCACHEMGMT_VERBOSE        Default: 0
       --color WHEN  Colorize text output: always, never or auto (auto means
                     color only when STDOUT is a terminal).
                     Env: BCACHEMGMT_COLOR          Default: auto
@@ -98,35 +217,176 @@ Options:
   -r, --sysfs-root DIR
                     Read the device state below DIR instead of /sys. Intended
                     for testing against a captured sysfs tree; checks that
-                    need the live system are skipped when DIR is not /sys.
+                    need the live system are skipped, and every changing
+                    command refuses to run unless --dry-run is also given.
                     Env: BCACHEMGMT_SYSFS_ROOT     Default: /sys
+      --config FILE Read FILE instead of searching for the configuration file
+                    in the standard locations. "none" disables it entirely.
+                    Env: BCACHEMGMT_CONFIG         Default: (search)
   -h, --help        Show this help and exit.
   -V, --version     Show the version and exit.
 
-Precedence for every option: command-line argument > environment variable
-> built-in default.
+Options for the changing commands:
+  -n, --dry-run     Show every write that would be performed, without
+                    performing it. Nothing is changed.
+                    Env: BCACHEMGMT_DRY_RUN        Default: 0
+  -y, --yes         Assume "yes" for the confirmation prompt. Required for
+                    destructive commands in a non-interactive context.
+                    Env: BCACHEMGMT_YES            Default: 0
+  -f, --force       Override the safety guards of "stop" and "make" (mounted
+                    filesystem, dirty data, device already in use).
+                    Env: BCACHEMGMT_FORCE          Default: 0
+  -t, --timeout SECONDS
+                    How long to wait for a flush or a detach to finish.
+                    0 disables the timeout and waits indefinitely.
+                    Env: BCACHEMGMT_TIMEOUT        Default: 300
+  -c, --cache CACHE "attach" only: the cache set to attach to, given as its
+                    UUID or as one of its cache devices. May be omitted when
+                    exactly one cache set exists.
+                    Env: BCACHEMGMT_CACHE          Default: (autodetect)
+
+Options for "doctor":
+  -m, --min-available PERCENT
+                    Warn when a cache set reports less than PERCENT available
+                    cache space.
+                    Env: BCACHEMGMT_MIN_AVAILABLE  Default: 10
+
+Options for "make":
+  -B, --backing DEV Create a backing device on DEV. May be repeated.
+                    Env: BCACHEMGMT_BACKING        Default: (none)
+                    (comma separated when given as a variable)
+  -C, --cache-device DEV
+                    Create a cache device on DEV. May be repeated. Note the
+                    difference to -c/--cache, which belongs to "attach".
+                    Env: BCACHEMGMT_CACHE_DEVICES  Default: (none)
+                    (comma separated when given as a variable)
+      --cache-mode MODE
+                    Cache mode for the new backing devices: writethrough,
+                    writeback, writearound or none.
+                    Env: BCACHEMGMT_CACHE_MODE     Default: (make-bcache)
+      --bucket-size SIZE
+                    Bucket size for the new cache devices, for example 512k.
+                    Env: BCACHEMGMT_BUCKET_SIZE    Default: (make-bcache)
+      --block-size SIZE
+                    Block size for the new devices, for example 4k.
+                    Env: BCACHEMGMT_BLOCK_SIZE     Default: (make-bcache)
+      --wipe        Allow make-bcache to overwrite an existing bcache
+                    superblock on the target device.
+                    Env: BCACHEMGMT_WIPE           Default: 0
+      --no-register Do not register the new devices with the kernel after
+                    creating them.
+                    Env: BCACHEMGMT_REGISTER       Default: 1
+
+Options for "replace":
+      --cache-set UUID
+                    The cache set whose cache device is being replaced.
+                    May be omitted when exactly one cache set exists.
+                    Env: BCACHEMGMT_CACHE_SET      Default: (autodetect)
+      --new DEV     The new, empty cache device.
+                    Env: BCACHEMGMT_NEW_CACHE      Default: (none)
+      --bucket-size, --block-size, --wipe
+                    As for "make", applied to the new cache device.
+
+Configuration file:
+  The desired state and the defaults for most options are read from
+  "bcachemgmt.conf". It is a shell fragment that is sourced, and it is looked
+  up in this order; the first match per scope wins, the user scope overrides
+  the system scope:
+    /etc/${ORGANIZATION}/bcachemgmt.conf   (ORGANIZATION from /etc/org.conf)
+    /etc/orgdefault/bcachemgmt.conf
+    /etc/bcachemgmt.conf
+    ${HOME}/.config/${ORGANIZATION}/bcachemgmt.conf
+    ${HOME}/.config/orgdefault/bcachemgmt.conf
+    ${HOME}/.config/bcachemgmt.conf
+  Settings are plain assignments (MIN_AVAILABLE=15). The desired state is
+  declared with the device, cache_set and cache_device directives:
+    device bcache0 cache_mode=writeback writeback_percent=10
+    device all     sequential_cutoff=4M
+    cache_set all  congested_read_threshold_us=2000
+  "all" as the name addresses every device of that kind. Run
+  "bcachemgmt diff" to see what a configuration would change.
+
+Precedence for every option: command-line argument > environment variable >
+configuration file > built-in default. --yes and --force are deliberately
+not settable from the configuration file, so a file can never silently
+disarm the safety prompts.
 
 Exit status:
-  0  Command finished and, for "doctor", no problem was found.
-  1  An error occurred, or "doctor" reported at least one warning or a
-     critical finding. The message itself is the primary information.
+  0  Command finished; for "doctor" no problem was found and for "diff" the
+     running state matches the configuration.
+  1  An error occurred, "doctor" reported at least one warning or critical
+     finding, or "diff" found drift. The message itself is the primary
+     information.
   2  Invalid invocation (unknown option, missing argument, unknown command).
 
 Examples:
-  bcachemgmt status
   bcachemgmt status --long bcache0
-  bcachemgmt status --json | jq '.backing_devices[].cache_mode'
   bcachemgmt doctor --min-available 20
+  bcachemgmt diff
+  bcachemgmt apply --dry-run
+  bcachemgmt flush bcache0 --timeout 600
+  bcachemgmt attach --cache /dev/nvme0n1p1 bcache0
+  bcachemgmt stop --yes bcache1
+  bcachemgmt make -B /dev/sdb1 -C /dev/nvme0n1p1 --cache-mode writeback
+  bcachemgmt replace --cache-set 5a3c1f2e-... --new /dev/nvme1n1p1
 EOF
 }
 
 # ==========================================================================
-# Output helpers
+# Output and logging
 # ==========================================================================
 
-# Report an explicit, anticipated failure on STDERR and exit non-zero.
+# The console is the primary output channel. In addition, every operation
+# that actually changes a device is recorded in syslog/journal via "logger",
+# together with the errors that abort such an operation. The reporting
+# commands (status, doctor, diff) deliberately stay out of the system log:
+# they change nothing, and logging every status call would only add noise.
+
+# Print a normal status message to STDOUT.
+msg() {
+    printf '%s\n' "$*"
+}
+
+# Print a diagnostic detail to STDOUT, but only in verbose mode. Used for the
+# individual steps of a changing command, for example each single sysfs write.
+vmsg() {
+    if [ "${VERBOSE:-0}" = "1" ]; then
+        printf '%s\n' "$*"
+    fi
+}
+
+# Print a warning to STDERR. Warnings do not abort the command.
+warn() {
+    printf '%s: warning: %s\n' "${SCRIPT_NAME}" "$*" >&2
+}
+
+# Record a change in syslog and print it to STDOUT.
+#
+# This is the audit trail for everything the tool modifies. It is called
+# after the change succeeded, so the log describes what really happened. In
+# a dry run the entry is only printed, never logged: nothing happened, and a
+# system log claiming otherwise would be actively misleading.
+audit() {
+    local message="$*"
+    if [ "${DRY_RUN}" = "1" ]; then
+        # The message is phrased in the past tense, because that is what the
+        # log entry has to say. "would have" is the one prefix that stays
+        # grammatical in front of all of them.
+        printf 'would have %s\n' "${message}"
+        return 0
+    fi
+    logger -t "${SCRIPT_NAME}" -p user.notice -- "${message}" || true
+    printf '%s\n' "${message}"
+}
+
+# Report an explicit, anticipated failure on STDERR and exit non-zero. When a
+# changing command is running, the reason is also written to syslog so a
+# half-finished operation can be reconstructed afterwards.
 die() {
     printf '%s: error: %s\n' "${SCRIPT_NAME}" "$*" >&2
+    if [ "${WRITE_COMMAND}" -eq 1 ]; then
+        logger -t "${SCRIPT_NAME}" -p user.err -- "aborted: $*" || true
+    fi
     exit 1
 }
 
@@ -300,8 +560,8 @@ dev_path_for() {
 # Stable device names (/dev/disk/by-id)
 # ==========================================================================
 
-declare -A BYID_NAME=()
-declare -A BYID_RANK=()
+declare -gA BYID_NAME=()
+declare -gA BYID_RANK=()
 
 # Rank a by-id link so the most useful identifier wins when a device has
 # several. Lower is better: hardware identifiers beat generic ones, and
@@ -346,20 +606,20 @@ byid_for() {
 
 # Backing devices, indexed by position in BDEV_ORDER. Fields are stored as
 # "index|field" keys because bash has no nested data structures.
-declare -A BDEV=()
-declare -a BDEV_ORDER=()
+declare -gA BDEV=()
+declare -ga BDEV_ORDER=()
 
 # Cache devices and cache sets, same layout.
-declare -A CDEV=()
-declare -a CDEV_ORDER=()
-declare -A CSET=()
-declare -a CSET_ORDER=()
+declare -gA CDEV=()
+declare -ga CDEV_ORDER=()
+declare -gA CSET=()
+declare -ga CSET_ORDER=()
 
 # Flash-only volumes: bcache block devices without a backing device.
-declare -a FLASH_VOLUMES=()
+declare -ga FLASH_VOLUMES=()
 
 # Block devices that carry a bcache superblock but are not registered.
-declare -a UNREGISTERED=()
+declare -ga UNREGISTERED=()
 
 # Set when the unregistered scan could not run, with the reason.
 UNREGISTERED_SKIPPED=""
@@ -369,7 +629,7 @@ UNREGISTERED_SKIPPED=""
 LIVE_SYSTEM=0
 
 # Names of all registered devices, used to spot unregistered superblocks.
-declare -A REGISTERED=()
+declare -gA REGISTERED=()
 
 # Collect one backing device from its sysfs directory.
 collect_backing_device() {
@@ -512,6 +772,24 @@ collect_state() {
     done
 }
 
+# Read one field from a line of "lsblk --pairs" output.
+#
+# --pairs is used instead of --raw throughout: in raw output an empty column
+# collapses into its neighbour and shifts every following field one position
+# to the left, so a device with no filesystem but a mount point parses as a
+# device whose filesystem is named after its mount point. --pairs names every
+# value and quotes it, which removes the ambiguity.
+lsblk_field() {
+    local line="${1}"
+    local key="${2}"
+
+    if [[ "${line}" =~ (^|[[:space:]])${key}=\"([^\"]*)\" ]]; then
+        printf '%s' "${BASH_REMATCH[2]}"
+    else
+        printf ''
+    fi
+}
+
 # Find block devices that carry a bcache superblock but are not registered.
 # This relies on lsblk reading the on-disk signature, so it only works on
 # the live system.
@@ -527,11 +805,14 @@ collect_unregistered() {
         return 0
     fi
 
-    while IFS=' ' read -r name fstype size; do
+    while IFS= read -r line; do
+        fstype="$(lsblk_field "${line}" FSTYPE)"
         [ "${fstype}" = "bcache" ] || continue
+        name="$(lsblk_field "${line}" NAME)"
         [ -n "${REGISTERED[${name}]:-}" ] && continue
+        size="$(lsblk_field "${line}" SIZE)"
         UNREGISTERED+=("${name} ${size}")
-    done < <(lsblk --raw --noheadings --output NAME,FSTYPE,SIZE)
+    done < <(lsblk --pairs --noheadings --output NAME,FSTYPE,SIZE)
 }
 
 # Describe what sits on top of a bcache device: its own filesystem plus any
@@ -548,7 +829,10 @@ collect_usage() {
         [ -n "${bcache_dev}" ] || continue
         [ -b "/dev/${bcache_dev}" ] || continue
         parts=""
-        while IFS=' ' read -r name fstype mountpoint; do
+        while IFS= read -r line; do
+            name="$(lsblk_field "${line}" NAME)"
+            fstype="$(lsblk_field "${line}" FSTYPE)"
+            mountpoint="$(lsblk_field "${line}" MOUNTPOINT)"
             # The device itself only matters when it is mounted or formatted;
             # holders are always worth showing because they explain the stack.
             if [ -n "${mountpoint}" ]; then
@@ -558,7 +842,7 @@ collect_usage() {
             elif [ "${name}" = "${bcache_dev}" ] && [ -n "${fstype}" ]; then
                 parts="${parts}${parts:+, }${fstype}"
             fi
-        done < <(lsblk --raw --noheadings --output NAME,FSTYPE,MOUNTPOINT -- "/dev/${bcache_dev}")
+        done < <(lsblk --pairs --noheadings --output NAME,FSTYPE,MOUNTPOINT -- "/dev/${bcache_dev}")
         BDEV["${idx}|usage"]="${parts}"
     done
 }
@@ -599,22 +883,459 @@ cache_path_of_backing() {
     printf '%s' "$(cache_devices_of_set "${uuid}")"
 }
 
+# ==========================================================================
+# Value normalization
+# ==========================================================================
+
+# Convert a size to plain bytes. Accepts what the kernel prints back ("4.0M",
+# "0.0k", "1.5G") as well as what an operator writes in a configuration file
+# ("4M", "4096", "0"). Prints nothing when the input cannot be understood.
+#
+# The kernel echoes a size back in its own formatting, so comparing the raw
+# strings would report permanent, non-existent drift ("4M" != "4.0M"). Every
+# comparison of a size therefore goes through this function.
+size_to_bytes() {
+    local raw="${1}"
+    local unit num int frac mult=1
+
+    raw="${raw//[[:space:]]/}"
+    if [ -z "${raw}" ]; then
+        printf ''
+        return 0
+    fi
+
+    unit="${raw: -1}"
+    case "${unit}" in
+        k|K) mult=1024 ;;
+        m|M) mult=$((1024 * 1024)) ;;
+        g|G) mult=$((1024 * 1024 * 1024)) ;;
+        t|T) mult=$((1024 * 1024 * 1024 * 1024)) ;;
+        [0-9]) mult=1 ;;
+        *) printf ''; return 0 ;;
+    esac
+    if [ "${mult}" -eq 1 ]; then
+        num="${raw}"
+    else
+        num="${raw%?}"
+    fi
+
+    # One fractional digit is what the kernel prints; three are accepted so a
+    # hand written value is not silently truncated.
+    if [[ "${num}" =~ ^([0-9]+)$ ]]; then
+        int="${num}"
+        frac="000"
+    elif [[ "${num}" =~ ^([0-9]*)\.([0-9]+)$ ]]; then
+        int="${BASH_REMATCH[1]:-0}"
+        frac="${BASH_REMATCH[2]}000"
+        frac="${frac:0:3}"
+    else
+        printf ''
+        return 0
+    fi
+
+    # Strip leading zeros so the arithmetic does not read them as octal.
+    int="$((10#${int}))"
+    frac="$((10#${frac}))"
+    printf '%s' "$(( (int * 1000 + frac) * mult / 1000 ))"
+}
+
+# True when a kernel formatted size is zero, whatever unit it carries.
+size_is_zero() {
+    local bytes
+    bytes="$(size_to_bytes "${1}")"
+    [ "${bytes:-0}" = "0" ]
+}
+
+# ==========================================================================
+# Guarded writes
+# ==========================================================================
+
+# Refuse to modify anything unless the tool is talking to the real kernel
+# interface and has the privileges to do so. With a captured sysfs tree the
+# planning half of a command is still useful, so a dry run stays allowed.
+require_writable_sysfs() {
+    if [ "${DRY_RUN}" = "1" ]; then
+        return 0
+    fi
+    if [ "${LIVE_SYSTEM}" -ne 1 ]; then
+        die "refusing to modify devices while --sysfs-root is ${SYSFS_ROOT}; add --dry-run to see what would happen"
+    fi
+    if [ "${EUID}" -ne 0 ]; then
+        die "writing to sysfs requires root privileges; re-run as root or add --dry-run"
+    fi
+}
+
+# Write a value to a sysfs attribute. This is the single choke point for
+# every modification the tool makes, so the dry run and the verbose trace are
+# guaranteed to cover all of them.
+#
+# The native error message of the failed write is kept and passed on: only
+# the kernel knows whether it rejected the value, the state or the timing.
+sysfs_write() {
+    local path="${1}"
+    local value="${2}"
+    local err_output
+
+    if [ "${DRY_RUN}" = "1" ]; then
+        vmsg "dry run: would write '${value}' to ${path}"
+        return 0
+    fi
+    if [ ! -e "${path}" ]; then
+        die "sysfs attribute does not exist: ${path}"
+    fi
+    vmsg "writing '${value}' to ${path}"
+    if ! err_output="$( { printf '%s' "${value}" >"${path}"; } 2>&1 )"; then
+        die "writing '${value}' to ${path} failed: ${err_output:-unknown error}"
+    fi
+    return 0
+}
+
+# Ask for confirmation before a destructive step.
+#
+# Without a terminal there is nobody to ask, so the command aborts instead of
+# silently assuming consent: an unattended cron job must state its intent
+# with --yes rather than inherit it from the absence of a user.
+confirm() {
+    local prompt="${1}"
+    local answer=""
+
+    if [ "${DRY_RUN}" = "1" ]; then
+        return 0
+    fi
+    if [ "${ASSUME_YES}" = "1" ]; then
+        vmsg "confirmation assumed by --yes: ${prompt}"
+        return 0
+    fi
+    if [ ! -t 0 ]; then
+        die "${prompt} - refusing to continue without a terminal; pass --yes to confirm non-interactively"
+    fi
+    read -r -p "${prompt} [y/N] " answer || answer=""
+    case "${answer}" in
+        y|Y|yes|YES|Yes) return 0 ;;
+    esac
+    return 1
+}
+
+# Run an external helper, keeping its own output visible. Used for the
+# make-bcache and wipefs calls, whose diagnostics are far more precise than
+# anything this script could reconstruct.
+run_external() {
+    if [ "${DRY_RUN}" = "1" ]; then
+        msg "would run: $*"
+        return 0
+    fi
+    vmsg "running: $*"
+    "$@"
+}
+
+# ==========================================================================
+# Addressing devices
+# ==========================================================================
+
+# Decide whether a backing device matches a key given by the user or by the
+# configuration file. Accepted forms: the bcache device name (bcache0), the
+# kernel name (sdb1), a device path (/dev/sdb1, /dev/mapper/x), a
+# /dev/disk/by-id name, the backing device UUID, the bcache label, and the
+# wildcard "all".
+backing_key_matches() {
+    local idx="${1}"
+    local key="${2}"
+
+    if [ "${key}" = "all" ] || [ "${key}" = "*" ]; then
+        return 0
+    fi
+    key="${key#/dev/}"
+    key="${key#mapper/}"
+    key="${key#disk/by-id/}"
+    if [ "${key}" = "${BDEV[${idx}|kernel_name]}" ] \
+    || [ "${key}" = "${BDEV[${idx}|bcache_dev]}" ] \
+    || [ "${key}" = "${BDEV[${idx}|byid]}" ] \
+    || [ "${key}" = "${BDEV[${idx}|backing_dev_uuid]}" ] \
+    || [ "${key}" = "${BDEV[${idx}|label]}" ]; then
+        return 0
+    fi
+    return 1
+}
+
 # Decide whether a backing device matches the device filter given on the
 # command line. Without a filter every device matches.
 backing_matches_filter() {
     local idx="${1}"
     local pattern
-    [ "${#DEVICE_FILTER[@]}" -gt 0 ] || return 0
+
+    if [ "${#DEVICE_FILTER[@]}" -eq 0 ]; then
+        return 0
+    fi
     for pattern in "${DEVICE_FILTER[@]}"; do
-        pattern="${pattern#/dev/}"
-        pattern="${pattern#mapper/}"
-        if [ "${pattern}" = "${BDEV[${idx}|kernel_name]}" ] \
-        || [ "${pattern}" = "${BDEV[${idx}|bcache_dev]}" ] \
-        || [ "${pattern}" = "${BDEV[${idx}|byid]}" ]; then
+        if backing_key_matches "${idx}" "${pattern}"; then
             return 0
         fi
     done
     return 1
+}
+
+# Print the indices of all backing devices matching a key, one per line.
+# Prints nothing when the key matches no device; the caller decides whether
+# that is an error.
+resolve_backing_indices() {
+    local key="${1}"
+    local idx
+
+    if [ "${#BDEV_ORDER[@]}" -eq 0 ]; then
+        return 0
+    fi
+    for idx in "${BDEV_ORDER[@]}"; do
+        if backing_key_matches "${idx}" "${key}"; then
+            printf '%s\n' "${idx}"
+        fi
+    done
+}
+
+# Resolve a key to exactly one backing device index, or abort with a message
+# that names the ambiguity. Used by the commands that act on single devices.
+resolve_one_backing() {
+    local key="${1}"
+    local -a found=()
+    local idx names=""
+
+    mapfile -t found < <(resolve_backing_indices "${key}")
+    if [ "${#found[@]}" -eq 0 ]; then
+        die "no bcache backing device matches '${key}'; run '${SCRIPT_NAME} status' to see the registered devices"
+    fi
+    if [ "${#found[@]}" -gt 1 ]; then
+        for idx in "${found[@]}"; do
+            names="${names}${names:+, }${BDEV[${idx}|dev_path]}"
+        done
+        die "'${key}' matches more than one backing device (${names}); address them individually"
+    fi
+    printf '%s' "${found[0]}"
+}
+
+# Print the index of a cache device matching a key, or nothing.
+resolve_cache_device_index() {
+    local key="${1}"
+    local idx
+
+    key="${key#/dev/}"
+    key="${key#mapper/}"
+    key="${key#disk/by-id/}"
+    if [ "${#CDEV_ORDER[@]}" -eq 0 ]; then
+        return 0
+    fi
+    for idx in "${CDEV_ORDER[@]}"; do
+        if [ "${key}" = "${CDEV[${idx}|kernel_name]}" ] \
+        || [ "${key}" = "${CDEV[${idx}|byid]}" ]; then
+            printf '%s' "${idx}"
+            return 0
+        fi
+    done
+}
+
+# Resolve a cache set, given either as its UUID or as one of its cache
+# devices. An empty key resolves to the only cache set when there is exactly
+# one, which is by far the most common layout. Prints the UUID.
+resolve_cache_set_uuid() {
+    local key="${1}"
+    local idx cdev_idx uuids=""
+
+    if [ -z "${key}" ]; then
+        if [ "${#CSET_ORDER[@]}" -eq 1 ]; then
+            printf '%s' "${CSET[${CSET_ORDER[0]}|uuid]}"
+            return 0
+        fi
+        if [ "${#CSET_ORDER[@]}" -eq 0 ]; then
+            die "no cache set is registered; nothing to attach to"
+        fi
+        for idx in "${CSET_ORDER[@]}"; do
+            uuids="${uuids}${uuids:+, }${CSET[${idx}|uuid]}"
+        done
+        die "more than one cache set exists (${uuids}); name the one to use"
+    fi
+
+    if [ "${#CSET_ORDER[@]}" -gt 0 ]; then
+        for idx in "${CSET_ORDER[@]}"; do
+            if [ "${key}" = "${CSET[${idx}|uuid]}" ]; then
+                printf '%s' "${key}"
+                return 0
+            fi
+        done
+    fi
+
+    # Not a UUID, so try to read it as one of the cache devices of a set.
+    cdev_idx="$(resolve_cache_device_index "${key}")"
+    if [ -n "${cdev_idx}" ] && [ -n "${CDEV[${cdev_idx}|cache_set]}" ]; then
+        printf '%s' "${CDEV[${cdev_idx}|cache_set]}"
+        return 0
+    fi
+    die "no cache set matches '${key}'; give its UUID or one of its cache devices"
+}
+
+# Print the sysfs directory of a cache set.
+cache_set_sysfs() {
+    local uuid="${1}"
+    local idx
+
+    if [ "${#CSET_ORDER[@]}" -gt 0 ]; then
+        for idx in "${CSET_ORDER[@]}"; do
+            if [ "${CSET[${idx}|uuid]}" = "${uuid}" ]; then
+                printf '%s' "${CSET[${idx}|sysfs]}"
+                return 0
+            fi
+        done
+    fi
+    printf '%s/fs/bcache/%s' "${SYSFS_ROOT}" "${uuid}"
+}
+
+# ==========================================================================
+# Safety guards for the changing commands
+# ==========================================================================
+
+# Report where any of the given kernel device names is mounted, as a comma
+# separated list. Empty when none of them is.
+#
+# The mount source is resolved before it is compared: /proc/self/mounts names
+# a device the way it was mounted, which for LVM and by-id paths is a symlink
+# and not the kernel name. Comparing the strings would miss exactly the
+# stacked setups this guard exists for.
+mount_points_of_names() {
+    local source target rest resolved name result=""
+
+    if [ "$#" -eq 0 ] || [ ! -r /proc/self/mounts ]; then
+        printf ''
+        return 0
+    fi
+    while read -r source target rest; do
+        case "${source}" in
+            /dev/*) ;;
+            *) continue ;;
+        esac
+        resolved="$(readlink -f -- "${source}" 2>/dev/null || printf '%s' "${source}")"
+        resolved="${resolved##*/}"
+        for name in "$@"; do
+            if [ -n "${name}" ] && [ "${resolved}" = "${name}" ]; then
+                # Mount points are escaped in /proc/self/mounts; the octal
+                # escape for a space is the only one worth undoing here.
+                target="${target//\\040/ }"
+                result="${result}${result:+, }${target}"
+            fi
+        done
+    done < /proc/self/mounts
+    printf '%s' "${result}"
+}
+
+# Report where a bcache device is mounted. Reads /proc/self/mounts, so it
+# only works on the live system; a captured tree yields nothing and the
+# caller falls back to the collected usage information.
+mounted_targets_of() {
+    local bcache_dev="${1}"
+
+    if [ -z "${bcache_dev}" ]; then
+        printf ''
+        return 0
+    fi
+    mount_points_of_names "${bcache_dev}"
+}
+
+# Report the holders of a block device (LVM, LUKS, MD, ...) as a comma
+# separated list. A holder means the device is part of a live stack even when
+# nothing is mounted directly on it.
+holders_of() {
+    local name="${1}"
+    local holder sysfs result=""
+
+    if [ -z "${name}" ]; then
+        printf ''
+        return 0
+    fi
+    sysfs="$(sysfs_dir_for_device "${name}")"
+    if [ -z "${sysfs}" ]; then
+        printf ''
+        return 0
+    fi
+    for holder in "${sysfs}/holders"/*; do
+        [ -e "${holder}" ] || continue
+        result="${result}${result:+, }${holder##*/}"
+    done
+    printf '%s' "${result}"
+}
+
+# Refuse to act on a backing device that is still in use, unless --force was
+# given. This is the guard that separates "stop the device I am done with"
+# from "pull the disk out from under a mounted filesystem".
+guard_device_in_use() {
+    local idx="${1}"
+    local action="${2}"
+    local bcache_dev mounts holders
+
+    bcache_dev="${BDEV[${idx}|bcache_dev]}"
+    mounts="$(mounted_targets_of "${bcache_dev}")"
+    holders="$(holders_of "${bcache_dev}")"
+
+    if [ -n "${mounts}" ]; then
+        if [ "${FORCE}" != "1" ]; then
+            die "refusing to ${action} /dev/${bcache_dev}: it is mounted on ${mounts}; unmount it first or pass --force"
+        fi
+        warn "/dev/${bcache_dev} is mounted on ${mounts} and is being ${action}ped anyway because --force was given"
+    fi
+    if [ -n "${holders}" ]; then
+        if [ "${FORCE}" != "1" ]; then
+            die "refusing to ${action} /dev/${bcache_dev}: it is in use by ${holders}; dismantle that layer first or pass --force"
+        fi
+        warn "/dev/${bcache_dev} is in use by ${holders} and is being ${action}ped anyway because --force was given"
+    fi
+}
+
+# Refuse to act on a device that still holds dirty data, unless --force was
+# given. Dirty data lives only on the cache device; dropping the cache while
+# it is unwritten loses exactly that data.
+guard_dirty_data() {
+    local idx="${1}"
+    local action="${2}"
+    local dirty
+
+    # Read the current value instead of the collected one: a flush earlier in
+    # the same run may have cleaned the device since the snapshot was taken.
+    dirty="$(sysfs_read "${BDEV[${idx}|sysfs]}/dirty_data")"
+    if [ -z "${dirty}" ]; then
+        dirty="${BDEV[${idx}|dirty_data]}"
+    fi
+    if [ -z "${dirty}" ] || size_is_zero "${dirty}"; then
+        return 0
+    fi
+    if [ "${FORCE}" != "1" ]; then
+        die "refusing to ${action} ${BDEV[${idx}|dev_path]}: it holds ${dirty} of dirty data that only exists on the cache; run '${SCRIPT_NAME} flush ${BDEV[${idx}|bcache_dev]:-${BDEV[${idx}|kernel_name]}}' first, or pass --force to discard it"
+    fi
+    warn "${BDEV[${idx}|dev_path]} holds ${dirty} of dirty data and is being ${action}ped anyway because --force was given"
+}
+
+# Wait until a condition holds, polling once per second.
+#
+# Returns 0 as soon as the condition is true and 1 when the timeout expires.
+# A timeout of 0 waits indefinitely, which is the right choice for a large
+# writeback that must not be interrupted halfway.
+wait_for_condition() {
+    local description="${1}"
+    local timeout="${2}"
+    shift 2
+    local waited=0
+
+    if [ "${DRY_RUN}" = "1" ]; then
+        vmsg "dry run: not waiting for ${description}"
+        return 0
+    fi
+    while ! "$@"; do
+        if [ "${timeout}" -gt 0 ] && [ "${waited}" -ge "${timeout}" ]; then
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+        # A long wait without any sign of life is indistinguishable from a
+        # hang, so report progress at a readable interval.
+        if [ $((waited % 10)) -eq 0 ]; then
+            vmsg "still waiting for ${description} (${waited}s)"
+        fi
+    done
+    return 0
 }
 
 # ==========================================================================
@@ -917,10 +1638,10 @@ cmd_status() {
 # Command: doctor
 # ==========================================================================
 
-declare -a F_CHECK=()
-declare -a F_LEVEL=()
-declare -a F_DEVICE=()
-declare -a F_MESSAGE=()
+declare -ga F_CHECK=()
+declare -ga F_LEVEL=()
+declare -ga F_DEVICE=()
+declare -ga F_MESSAGE=()
 CHECK_MARK=0
 
 # Record one finding. LEVEL is one of ok, warn, crit, unknown.
@@ -1255,117 +1976,1940 @@ cmd_doctor() {
 }
 
 # ==========================================================================
+# Desired state: the configuration schema
+# ==========================================================================
+
+# Only attributes that the kernel actually accepts a write for are allowed in
+# the configuration. An unknown name is rejected when the file is read, not
+# when the write fails much later, so a typo is reported next to its cause.
+#
+# The type decides how a configured value is validated and, just as
+# importantly, how it is compared against what the kernel reports back:
+#   enum  one of a fixed set of words
+#   bool  0 or 1
+#   uint  an unsigned integer
+#   size  a byte count, compared numerically so "4M" equals "4.0M"
+declare -gA ATTR_TYPE=(
+    [backing.cache_mode]=enum
+    [backing.writeback_percent]=uint
+    [backing.writeback_running]=bool
+    [backing.writeback_delay]=uint
+    [backing.writeback_metadata]=bool
+    [backing.writeback_rate_minimum]=uint
+    [backing.writeback_rate_update_seconds]=uint
+    [backing.writeback_rate_p_term_inverse]=uint
+    [backing.writeback_rate_i_term_inverse]=uint
+    [backing.sequential_cutoff]=size
+    [backing.readahead]=size
+    [cacheset.congested_read_threshold_us]=uint
+    [cacheset.congested_write_threshold_us]=uint
+    [cacheset.errors]=enum
+    [cacheset.io_error_limit]=uint
+    [cacheset.journal_delay_ms]=uint
+    [cacheset.synchronous]=bool
+    [cacheset.gc_after_writeback]=bool
+    [cacheset.btree_shrinker_disabled]=bool
+    [cacheset.copy_gc_enabled]=bool
+    [cachedev.cache_replacement_policy]=enum
+    [cachedev.discard]=bool
+    [cachedev.io_error_halflife]=uint
+)
+
+# Allowed words per enum attribute.
+declare -gA ATTR_ENUM=(
+    [backing.cache_mode]="writethrough writeback writearound none"
+    [cacheset.errors]="unregister panic"
+    [cachedev.cache_replacement_policy]="lru fifo random"
+)
+
+# Upper bounds the kernel enforces silently by clamping. Checking them here
+# turns a value that would be quietly reduced into a visible error.
+declare -gA ATTR_MAX=(
+    [backing.writeback_percent]=40
+)
+
+# Human readable name of a scope, for messages.
+scope_label() {
+    case "${1}" in
+        backing)  printf 'device' ;;
+        cacheset) printf 'cache_set' ;;
+        cachedev) printf 'cache_device' ;;
+        *)        printf '%s' "${1}" ;;
+    esac
+}
+
+# ==========================================================================
+# Desired state: reading the configuration file
+# ==========================================================================
+
+# The declared desired state, in the order it appears in the file.
+declare -ga WANT_SCOPE=()
+declare -ga WANT_KEY=()
+declare -ga WANT_ATTR=()
+declare -ga WANT_VALUE=()
+
+# Validate a single attribute assignment and record it. Called by the three
+# configuration directives below.
+want_add() {
+    local scope="${1}"
+    local key="${2}"
+    shift 2
+    local assignment attr value type allowed max
+
+    if [ -z "${key}" ]; then
+        die "${CONFIG_LOADED:-configuration}: $(scope_label "${scope}") directive without a device name"
+    fi
+    if [ "$#" -eq 0 ]; then
+        die "${CONFIG_LOADED:-configuration}: $(scope_label "${scope}") ${key} has no attribute assignment"
+    fi
+
+    for assignment in "$@"; do
+        # Comments and empty continuation lines end up here as empty words.
+        [ -n "${assignment}" ] || continue
+        if [[ "${assignment}" != *=* ]]; then
+            die "${CONFIG_LOADED:-configuration}: $(scope_label "${scope}") ${key}: '${assignment}' is not an attribute=value assignment"
+        fi
+        attr="${assignment%%=*}"
+        value="${assignment#*=}"
+
+        type="${ATTR_TYPE[${scope}.${attr}]:-}"
+        if [ -z "${type}" ]; then
+            die "${CONFIG_LOADED:-configuration}: $(scope_label "${scope}") ${key}: '${attr}' is not a configurable bcache attribute"
+        fi
+        if [ -z "${value}" ]; then
+            die "${CONFIG_LOADED:-configuration}: $(scope_label "${scope}") ${key}: '${attr}' has an empty value"
+        fi
+
+        case "${type}" in
+            enum)
+                allowed=" ${ATTR_ENUM[${scope}.${attr}]} "
+                if [[ "${allowed}" != *" ${value} "* ]]; then
+                    die "${CONFIG_LOADED:-configuration}: $(scope_label "${scope}") ${key}: invalid ${attr} '${value}' (expected one of:${ATTR_ENUM[${scope}.${attr}]// / })"
+                fi
+                ;;
+            bool)
+                case "${value}" in
+                    0|1) ;;
+                    *) die "${CONFIG_LOADED:-configuration}: $(scope_label "${scope}") ${key}: ${attr} must be 0 or 1, not '${value}'" ;;
+                esac
+                ;;
+            uint)
+                if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
+                    die "${CONFIG_LOADED:-configuration}: $(scope_label "${scope}") ${key}: ${attr} must be an unsigned integer, not '${value}'"
+                fi
+                max="${ATTR_MAX[${scope}.${attr}]:-}"
+                if [ -n "${max}" ] && [ "${value}" -gt "${max}" ]; then
+                    die "${CONFIG_LOADED:-configuration}: $(scope_label "${scope}") ${key}: ${attr} must not exceed ${max}, got '${value}'"
+                fi
+                ;;
+            size)
+                if [ -z "$(size_to_bytes "${value}")" ]; then
+                    die "${CONFIG_LOADED:-configuration}: $(scope_label "${scope}") ${key}: ${attr} must be a size such as 0, 4096 or 4M, not '${value}'"
+                fi
+                ;;
+        esac
+
+        WANT_SCOPE+=("${scope}")
+        WANT_KEY+=("${key}")
+        WANT_ATTR+=("${attr}")
+        WANT_VALUE+=("${value}")
+    done
+}
+
+# The three directives a configuration file may use. They are plain shell
+# functions because the file is sourced, which keeps the parsing to shell
+# builtins and gives the operator line continuations and comments for free.
+#
+#   device       bcache0 cache_mode=writeback writeback_percent=10
+#   cache_set    all     congested_read_threshold_us=2000
+#   cache_device nvme0n1p1 cache_replacement_policy=lru
+device() {
+    local key="${1:-}"
+    shift || true
+    want_add backing "${key}" "$@"
+}
+
+cache_set() {
+    local key="${1:-}"
+    shift || true
+    want_add cacheset "${key}" "$@"
+}
+
+cache_device() {
+    local key="${1:-}"
+    shift || true
+    want_add cachedev "${key}" "$@"
+}
+
+# Resolve ORGANIZATION from /etc/org.conf. The file is sourced in a subshell
+# with errexit disabled there, so a missing file or a faulty line cannot abort
+# this script; only ORGANIZATION is extracted and the script's own variables
+# stay untouched. /etc/org.conf is root-controlled, so sourcing it is
+# acceptable.
+ORGANIZATION=""
+if [ -r /etc/org.conf ]; then
+    ORGANIZATION="$( set +e; . /etc/org.conf >/dev/null 2>&1; printf '%s' "${ORGANIZATION:-}" )"
+fi
+
+# Source the first matching configuration file per scope: the system scope
+# (/etc) first, then the user scope (${HOME}/.config) which overrides it.
+# Within a scope the first existing file wins.
+#
+# The file is sourced rather than parsed: it comes from root-controlled /etc
+# or from the caller's own home, so its origin is trusted, and sourcing uses
+# only shell builtins instead of forking a parser for every line.
+load_config() {
+    local explicit="${1}"
+    local -a sys_files=() user_files=()
+    local f
+
+    if [ "${explicit}" = "none" ]; then
+        vmsg "configuration file disabled by --config none"
+        return 0
+    fi
+    if [ -n "${explicit}" ]; then
+        if [ ! -r "${explicit}" ]; then
+            die "configuration file is not readable: ${explicit}"
+        fi
+        CONFIG_LOADED="${explicit}"
+        vmsg "loading configuration: ${explicit}"
+        # shellcheck source=/dev/null
+        . "${explicit}"
+        return 0
+    fi
+
+    if [ -n "${ORGANIZATION}" ]; then
+        sys_files+=("/etc/${ORGANIZATION}/${CONFIG_NAME}")
+        user_files+=("${HOME:-}/.config/${ORGANIZATION}/${CONFIG_NAME}")
+    fi
+    sys_files+=("/etc/orgdefault/${CONFIG_NAME}" "/etc/${CONFIG_NAME}")
+    user_files+=("${HOME:-}/.config/orgdefault/${CONFIG_NAME}" "${HOME:-}/.config/${CONFIG_NAME}")
+
+    for f in "${sys_files[@]}"; do
+        if [ -r "${f}" ]; then
+            vmsg "loading system configuration: ${f}"
+            CONFIG_LOADED="${f}"
+            # shellcheck source=/dev/null
+            . "${f}"
+            break
+        fi
+    done
+    for f in "${user_files[@]}"; do
+        if [ -r "${f}" ]; then
+            vmsg "loading user configuration: ${f}"
+            CONFIG_LOADED="${CONFIG_LOADED:+${CONFIG_LOADED}, }${f}"
+            # shellcheck source=/dev/null
+            . "${f}"
+            break
+        fi
+    done
+}
+
+# ==========================================================================
+# Desired state: comparing it against reality
+# ==========================================================================
+
+# The computed plan, one entry per configured attribute of a matched target.
+declare -ga PLAN_SCOPE=()
+declare -ga PLAN_TARGET=()
+declare -ga PLAN_PATH=()
+declare -ga PLAN_ATTR=()
+declare -ga PLAN_CURRENT=()
+declare -ga PLAN_DESIRED=()
+declare -ga PLAN_STATE=()
+
+# Read an attribute the way it has to be compared: the selected word for a
+# multiple-choice attribute, the raw value otherwise.
+read_attr_current() {
+    local dir="${1}"
+    local attr="${2}"
+    local raw
+
+    raw="$(sysfs_read "${dir}/${attr}")"
+    case "${attr}" in
+        cache_mode|errors|cache_replacement_policy)
+            sysfs_selected "${raw}"
+            ;;
+        *)
+            printf '%s' "${raw}"
+            ;;
+    esac
+}
+
+# Compare a current value against a desired one, using the comparison that
+# fits the attribute type. Sizes are compared as byte counts because the
+# kernel reformats them; everything else is compared literally.
+attr_values_equal() {
+    local scope="${1}"
+    local attr="${2}"
+    local current="${3}"
+    local desired="${4}"
+    local a b
+
+    if [ "${ATTR_TYPE[${scope}.${attr}]:-}" = "size" ]; then
+        a="$(size_to_bytes "${current}")"
+        b="$(size_to_bytes "${desired}")"
+        if [ -z "${a}" ] || [ -z "${b}" ]; then
+            return 1
+        fi
+        [ "${a}" = "${b}" ]
+        return
+    fi
+    [ "${current}" = "${desired}" ]
+}
+
+# Decide whether a target is covered by the device filter on the command
+# line. Backing devices use the full key matching; cache sets and cache
+# devices are matched by UUID or device name, so "apply /dev/nvme0n1p1" also
+# addresses that cache device.
+plan_target_in_filter() {
+    local scope="${1}"
+    local idx="${2}"
+    local pattern
+
+    if [ "${#DEVICE_FILTER[@]}" -eq 0 ]; then
+        return 0
+    fi
+    case "${scope}" in
+        backing)
+            backing_matches_filter "${idx}"
+            return
+            ;;
+        cacheset)
+            for pattern in "${DEVICE_FILTER[@]}"; do
+                if [ "${pattern}" = "${CSET[${idx}|uuid]}" ]; then
+                    return 0
+                fi
+            done
+            ;;
+        cachedev)
+            for pattern in "${DEVICE_FILTER[@]}"; do
+                pattern="${pattern#/dev/}"
+                if [ "${pattern}" = "${CDEV[${idx}|kernel_name]}" ] \
+                || [ "${pattern}" = "${CDEV[${idx}|byid]}" ]; then
+                    return 0
+                fi
+            done
+            ;;
+    esac
+    return 1
+}
+
+# Collect the effective desired value of every attribute for every target.
+#
+# A wildcard stanza ("device all ...") acts as a default layer: it is applied
+# first, so a stanza naming a specific device overrides it no matter where in
+# the file the two appear. Within one layer the last assignment wins, which
+# makes an appended line the obvious way to correct an earlier one.
+declare -gA EFFECTIVE=()
+declare -ga EFFECTIVE_KEYS=()
+
+collect_effective_state() {
+    local pass i scope key attr value idx wildcard
+    local -a indices=()
+
+    EFFECTIVE=()
+    EFFECTIVE_KEYS=()
+    [ "${#WANT_SCOPE[@]}" -gt 0 ] || return 0
+
+    for pass in wildcard specific; do
+        for i in "${!WANT_SCOPE[@]}"; do
+            scope="${WANT_SCOPE[i]}"
+            key="${WANT_KEY[i]}"
+            attr="${WANT_ATTR[i]}"
+            value="${WANT_VALUE[i]}"
+
+            wildcard=0
+            if [ "${key}" = "all" ] || [ "${key}" = "*" ]; then
+                wildcard=1
+            fi
+            if [ "${pass}" = "wildcard" ] && [ "${wildcard}" -eq 0 ]; then
+                continue
+            fi
+            if [ "${pass}" = "specific" ] && [ "${wildcard}" -eq 1 ]; then
+                continue
+            fi
+
+            indices=()
+            case "${scope}" in
+                backing)  mapfile -t indices < <(resolve_backing_indices "${key}") ;;
+                cacheset) mapfile -t indices < <(resolve_cacheset_indices "${key}") ;;
+                cachedev) mapfile -t indices < <(resolve_cachedev_indices "${key}") ;;
+            esac
+
+            if [ "${#indices[@]}" -eq 0 ]; then
+                # A stanza for a device that is not present is a fact worth
+                # knowing (the disk did not come back after a reboot), but it
+                # is not an error: the same file is meant to describe several
+                # machines.
+                if [ "${wildcard}" -eq 0 ]; then
+                    vmsg "configuration: no $(scope_label "${scope}") matches '${key}'"
+                fi
+                continue
+            fi
+            for idx in "${indices[@]}"; do
+                if [ -z "${EFFECTIVE[${scope}|${idx}|${attr}]+set}" ]; then
+                    EFFECTIVE_KEYS+=("${scope}|${idx}|${attr}")
+                fi
+                EFFECTIVE["${scope}|${idx}|${attr}"]="${value}"
+            done
+        done
+    done
+}
+
+# Print the indices of all cache sets matching a key.
+resolve_cacheset_indices() {
+    local key="${1}"
+    local idx
+
+    [ "${#CSET_ORDER[@]}" -gt 0 ] || return 0
+    for idx in "${CSET_ORDER[@]}"; do
+        if [ "${key}" = "all" ] || [ "${key}" = "*" ] || [ "${key}" = "${CSET[${idx}|uuid]}" ]; then
+            printf '%s\n' "${idx}"
+        fi
+    done
+}
+
+# Print the indices of all cache devices matching a key.
+resolve_cachedev_indices() {
+    local key="${1}"
+    local idx
+
+    [ "${#CDEV_ORDER[@]}" -gt 0 ] || return 0
+    key="${key#/dev/}"
+    key="${key#disk/by-id/}"
+    for idx in "${CDEV_ORDER[@]}"; do
+        if [ "${key}" = "all" ] || [ "${key}" = "*" ] \
+        || [ "${key}" = "${CDEV[${idx}|kernel_name]}" ] \
+        || [ "${key}" = "${CDEV[${idx}|byid]}" ]; then
+            printf '%s\n' "${idx}"
+        fi
+    done
+}
+
+# Turn the effective desired state into a plan: one entry per attribute, with
+# its current value, its desired value and the resulting state.
+#   match       the device already has the configured value
+#   drift       the value differs and apply would write it
+#   unsupported the kernel does not expose this attribute for this device
+build_plan() {
+    local entry scope idx attr desired current dir target state
+
+    PLAN_SCOPE=(); PLAN_TARGET=(); PLAN_PATH=()
+    PLAN_ATTR=(); PLAN_CURRENT=(); PLAN_DESIRED=(); PLAN_STATE=()
+
+    collect_effective_state
+    [ "${#EFFECTIVE_KEYS[@]}" -gt 0 ] || return 0
+
+    for entry in "${EFFECTIVE_KEYS[@]}"; do
+        scope="${entry%%|*}"
+        idx="${entry#*|}"
+        idx="${idx%%|*}"
+        attr="${entry##*|}"
+        desired="${EFFECTIVE[${entry}]}"
+
+        plan_target_in_filter "${scope}" "${idx}" || continue
+
+        case "${scope}" in
+            backing)
+                dir="${BDEV[${idx}|sysfs]}"
+                target="${BDEV[${idx}|bcache_dev]:-${BDEV[${idx}|kernel_name]}}"
+                ;;
+            cacheset)
+                dir="${CSET[${idx}|sysfs]}"
+                target="${CSET[${idx}|uuid]}"
+                ;;
+            cachedev)
+                dir="${CDEV[${idx}|sysfs]}"
+                target="${CDEV[${idx}|dev_path]}"
+                ;;
+        esac
+
+        if [ ! -e "${dir}/${attr}" ]; then
+            current=""
+            state="unsupported"
+        else
+            current="$(read_attr_current "${dir}" "${attr}")"
+            if attr_values_equal "${scope}" "${attr}" "${current}" "${desired}"; then
+                state="match"
+            else
+                state="drift"
+            fi
+        fi
+
+        PLAN_SCOPE+=("${scope}")
+        PLAN_TARGET+=("${target}")
+        PLAN_PATH+=("${dir}/${attr}")
+        PLAN_ATTR+=("${attr}")
+        PLAN_CURRENT+=("${current}")
+        PLAN_DESIRED+=("${desired}")
+        PLAN_STATE+=("${state}")
+    done
+}
+
+# ==========================================================================
+# Command: diff
+# ==========================================================================
+
+# Count the plan entries in a given state.
+plan_count() {
+    local wanted="${1}"
+    local i n=0
+
+    if [ "${#PLAN_STATE[@]}" -gt 0 ]; then
+        for i in "${!PLAN_STATE[@]}"; do
+            if [ "${PLAN_STATE[i]}" = "${wanted}" ]; then
+                n=$((n + 1))
+            fi
+        done
+    fi
+    printf '%s' "${n}"
+}
+
+# Render the drift as an aligned table. Attributes that already match are
+# only listed in verbose mode: the point of the command is what differs.
+render_diff_human() {
+    local i state
+    local -a r_state=() r_target=() r_attr=() r_current=() r_desired=()
+    local w_state=5 w_target=6 w_attr=9 w_current=7
+    local n_match n_drift n_unsupported
+
+    n_match="$(plan_count match)"
+    n_drift="$(plan_count drift)"
+    n_unsupported="$(plan_count unsupported)"
+
+    printf '%sdesired state%s\n\n' "${C_BOLD}" "${C_RESET}"
+
+    if [ "${#WANT_SCOPE[@]}" -eq 0 ]; then
+        if [ -z "${CONFIG_LOADED}" ]; then
+            printf 'No configuration file found; nothing is declared.\n'
+            printf 'Looked for %s below /etc and %s/.config.\n' "${CONFIG_NAME}" "${HOME:-~}"
+        else
+            printf 'Configuration %s declares no device state.\n' "${CONFIG_LOADED}"
+        fi
+        return 0
+    fi
+
+    if [ "${#PLAN_STATE[@]}" -gt 0 ]; then
+        for i in "${!PLAN_STATE[@]}"; do
+            state="${PLAN_STATE[i]}"
+            if [ "${state}" = "match" ] && [ "${VERBOSE}" != "1" ]; then
+                continue
+            fi
+            r_state+=("${state}")
+            r_target+=("${PLAN_TARGET[i]}")
+            r_attr+=("${PLAN_ATTR[i]}")
+            r_current+=("${PLAN_CURRENT[i]:-unknown}")
+            r_desired+=("${PLAN_DESIRED[i]}")
+        done
+    fi
+
+    if [ "${#r_state[@]}" -eq 0 ]; then
+        printf 'Everything declared in %s matches the running state.\n' "${CONFIG_LOADED:-the configuration}"
+    else
+        for i in "${!r_state[@]}"; do
+            [ "${#r_state[i]}" -gt "${w_state}" ] && w_state="${#r_state[i]}"
+            [ "${#r_target[i]}" -gt "${w_target}" ] && w_target="${#r_target[i]}"
+            [ "${#r_attr[i]}" -gt "${w_attr}" ] && w_attr="${#r_attr[i]}"
+            [ "${#r_current[i]}" -gt "${w_current}" ] && w_current="${#r_current[i]}"
+        done
+
+        printf '%s' "${C_BOLD}"
+        printf '%-*s  %-*s  %-*s  %-*s  %s' \
+            "${w_state}" "STATE" "${w_target}" "TARGET" "${w_attr}" "ATTRIBUTE" \
+            "${w_current}" "CURRENT" "DESIRED"
+        printf '%s\n' "${C_RESET}"
+
+        for i in "${!r_state[@]}"; do
+            local colored="${r_state[i]}"
+            case "${r_state[i]}" in
+                drift)       colored="${C_YELLOW}${r_state[i]}${C_RESET}" ;;
+                unsupported) colored="${C_RED}${r_state[i]}${C_RESET}" ;;
+                match)       colored="${C_GREEN}${r_state[i]}${C_RESET}" ;;
+            esac
+            printf '%-*s  %-*s  %-*s  %-*s  %s\n' \
+                "$((w_state + ${#colored} - ${#r_state[i]}))" "${colored}" \
+                "${w_target}" "${r_target[i]}" \
+                "${w_attr}" "${r_attr[i]}" \
+                "${w_current}" "${r_current[i]}" \
+                "${r_desired[i]}"
+        done
+    fi
+
+    printf '\n%d in sync, %d drifting, %d unsupported by this kernel\n' \
+        "${n_match}" "${n_drift}" "${n_unsupported}"
+    if [ "${n_drift}" -gt 0 ]; then
+        printf "Run '%s apply' to write the desired state.\n" "${SCRIPT_NAME}"
+    fi
+}
+
+# Render the same plan as JSON, with a summary block for monitoring.
+render_diff_json() {
+    local i first=1 status
+    local n_match n_drift n_unsupported
+
+    n_match="$(plan_count match)"
+    n_drift="$(plan_count drift)"
+    n_unsupported="$(plan_count unsupported)"
+    status="in-sync"
+    if [ "${n_drift}" -gt 0 ]; then
+        status="drift"
+    elif [ "${n_unsupported}" -gt 0 ]; then
+        status="unsupported"
+    fi
+
+    printf '{\n'
+    printf '  %s,\n' "$(json_kv tool "${SCRIPT_NAME}")"
+    printf '  %s,\n' "$(json_kv version "${SCRIPT_VERSION}")"
+    printf '  %s,\n' "$(json_kv generated "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")"
+    printf '  %s,\n' "$(json_kv config_file "${CONFIG_LOADED}")"
+    printf '  "summary": {%s, %s, %s, %s},\n' \
+        "$(json_kv status "${status}")" \
+        "$(json_kv_num in_sync "${n_match}")" \
+        "$(json_kv_num drift "${n_drift}")" \
+        "$(json_kv_num unsupported "${n_unsupported}")"
+    printf '  "entries": [\n'
+    if [ "${#PLAN_STATE[@]}" -gt 0 ]; then
+        for i in "${!PLAN_STATE[@]}"; do
+            [ "${first}" -eq 1 ] || printf ',\n'
+            first=0
+            printf '    {%s, %s, %s, %s, %s, %s, %s}' \
+                "$(json_kv scope "$(scope_label "${PLAN_SCOPE[i]}")")" \
+                "$(json_kv target "${PLAN_TARGET[i]}")" \
+                "$(json_kv attribute "${PLAN_ATTR[i]}")" \
+                "$(json_kv sysfs_path "${PLAN_PATH[i]}")" \
+                "$(json_kv current "${PLAN_CURRENT[i]}")" \
+                "$(json_kv desired "${PLAN_DESIRED[i]}")" \
+                "$(json_kv state "${PLAN_STATE[i]}")"
+        done
+        printf '\n'
+    fi
+    printf '  ]\n'
+    printf '}\n'
+}
+
+# Entry point for the diff command. Exits non-zero when the running state
+# does not match the configuration, so it can be used as a drift alarm.
+cmd_diff() {
+    local n_drift n_unsupported
+
+    build_plan
+    if [ "${JSON_OUTPUT}" -eq 1 ]; then
+        render_diff_json
+    else
+        render_diff_human
+    fi
+
+    n_drift="$(plan_count drift)"
+    n_unsupported="$(plan_count unsupported)"
+    if [ "${n_drift}" -gt 0 ] || [ "${n_unsupported}" -gt 0 ]; then
+        return 1
+    fi
+    return 0
+}
+
+# ==========================================================================
+# Command: apply
+# ==========================================================================
+
+# Write every drifting attribute and verify the result.
+#
+# The kernel silently clamps some values instead of rejecting them, so each
+# write is read back. Reporting the clamp is the only way an operator learns
+# that the configuration and the running state will never converge.
+cmd_apply() {
+    local i written=0 failed=0 dir attr readback
+
+    build_plan
+
+    if [ "${#WANT_SCOPE[@]}" -eq 0 ]; then
+        if [ -z "${CONFIG_LOADED}" ]; then
+            die "no configuration file found; looked for ${CONFIG_NAME} below /etc and ${HOME:-~}/.config"
+        fi
+        msg "Configuration ${CONFIG_LOADED} declares no device state; nothing to apply."
+        return 0
+    fi
+
+    if [ "$(plan_count drift)" -eq 0 ]; then
+        msg "Nothing to do: the running state already matches ${CONFIG_LOADED:-the configuration}."
+        if [ "$(plan_count unsupported)" -gt 0 ]; then
+            warn "$(plan_count unsupported) configured attribute(s) are not supported by this kernel; run '${SCRIPT_NAME} diff' for the list"
+        fi
+        return 0
+    fi
+
+    require_writable_sysfs
+
+    for i in "${!PLAN_STATE[@]}"; do
+        [ "${PLAN_STATE[i]}" = "drift" ] || continue
+
+        sysfs_write "${PLAN_PATH[i]}" "${PLAN_DESIRED[i]}"
+        audit "set ${PLAN_ATTR[i]} of ${PLAN_TARGET[i]} from '${PLAN_CURRENT[i]:-unknown}' to '${PLAN_DESIRED[i]}'"
+        written=$((written + 1))
+
+        if [ "${DRY_RUN}" != "1" ]; then
+            dir="${PLAN_PATH[i]%/*}"
+            attr="${PLAN_ATTR[i]}"
+            readback="$(read_attr_current "${dir}" "${attr}")"
+            if ! attr_values_equal "${PLAN_SCOPE[i]}" "${attr}" "${readback}" "${PLAN_DESIRED[i]}"; then
+                warn "${PLAN_TARGET[i]}: the kernel reports ${attr} as '${readback}' after writing '${PLAN_DESIRED[i]}'; the value was clamped or ignored"
+                failed=$((failed + 1))
+            fi
+        fi
+    done
+
+    if [ "${DRY_RUN}" = "1" ]; then
+        msg ""
+        msg "Dry run: ${written} attribute(s) would be written, nothing was changed."
+        return 0
+    fi
+
+    msg ""
+    msg "Applied ${written} attribute(s)."
+    if [ "${failed}" -gt 0 ]; then
+        die "${failed} attribute(s) did not take the configured value; see the warnings above"
+    fi
+
+    # Sysfs tunables do not survive a reboot. Saying so once, right after a
+    # successful apply, is what turns this command into a usable workflow
+    # instead of a change that quietly disappears at the next boot.
+    msg "Note: these are runtime settings. Run '${SCRIPT_NAME} apply' again after a reboot, or from a boot-time unit."
+    return 0
+}
+
+# ==========================================================================
+# Runtime operations: shared machinery
+# ==========================================================================
+
+# Attributes that were changed temporarily and must be put back, whatever
+# happens next. "flush" lowers writeback_percent to drain the cache; leaving
+# it at 0 after an interrupted run would permanently disable write caching on
+# that device, so the restore is wired to an EXIT trap rather than to the
+# normal end of the function.
+declare -ga RESTORE_PATHS=()
+declare -ga RESTORE_VALUES=()
+
+# Remember the current value of an attribute before changing it.
+remember_attribute() {
+    local path="${1}"
+    RESTORE_PATHS+=("${path}")
+    RESTORE_VALUES+=("$(sysfs_read "${path}")")
+}
+
+# Put every remembered attribute back. Failures are reported but do not
+# abort: this runs while the script is already on its way out, and the
+# remaining entries still deserve their chance.
+restore_attributes() {
+    local i path value err_output
+
+    [ "${#RESTORE_PATHS[@]}" -gt 0 ] || return 0
+    # A dry run changed nothing, so there is nothing to put back. Writing the
+    # old value again would still be a write, and a dry run performs none.
+    if [ "${DRY_RUN}" = "1" ]; then
+        RESTORE_PATHS=()
+        RESTORE_VALUES=()
+        return 0
+    fi
+    for i in "${!RESTORE_PATHS[@]}"; do
+        path="${RESTORE_PATHS[i]}"
+        value="${RESTORE_VALUES[i]}"
+        [ -n "${value}" ] || continue
+        [ -w "${path}" ] || continue
+        if err_output="$( { printf '%s' "${value}" >"${path}"; } 2>&1 )"; then
+            vmsg "restored ${path} to '${value}'"
+        else
+            warn "could not restore ${path} to '${value}': ${err_output:-unknown error}"
+        fi
+    done
+    RESTORE_PATHS=()
+    RESTORE_VALUES=()
+}
+
+# True when a backing device holds no dirty data any more.
+backing_is_clean() {
+    local dir="${1}"
+    size_is_zero "$(sysfs_read "${dir}/dirty_data")"
+}
+
+# True when a backing device is no longer attached to a cache set. Older
+# kernels name the link "cache", newer ones "set"; both must be gone.
+backing_is_detached() {
+    local dir="${1}"
+    if [ -L "${dir}/cache" ] || [ -L "${dir}/set" ]; then
+        return 1
+    fi
+    return 0
+}
+
+# True when a backing device is attached to a cache set, the inverse of the
+# check above. Used to confirm that an attach really took effect.
+backing_is_attached() {
+    local dir="${1}"
+    if [ -L "${dir}/cache" ] || [ -L "${dir}/set" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# True once the kernel has removed a block device.
+block_device_gone() {
+    [ ! -d "${SYSFS_ROOT}/block/${1}" ]
+}
+
+# True once a cache set has disappeared from /sys/fs/bcache.
+cache_set_gone() {
+    [ ! -d "${SYSFS_ROOT}/fs/bcache/${1}" ]
+}
+
+# Wait for a backing device to become clean, reporting the remaining dirty
+# data as it shrinks. A flush of a large writeback cache takes minutes, and
+# an operator watching a silent terminal cannot tell progress from a hang.
+wait_for_clean() {
+    local dir="${1}"
+    local label="${2}"
+    local timeout="${3}"
+    local waited=0 dirty
+
+    if [ "${DRY_RUN}" = "1" ]; then
+        vmsg "dry run: not waiting for ${label} to become clean"
+        return 0
+    fi
+    while ! backing_is_clean "${dir}"; do
+        if [ "${timeout}" -gt 0 ] && [ "${waited}" -ge "${timeout}" ]; then
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+        if [ $((waited % 10)) -eq 0 ]; then
+            dirty="$(sysfs_read "${dir}/dirty_data")"
+            msg "  ${label}: ${dirty:-unknown} still dirty after ${waited}s"
+        fi
+    done
+    return 0
+}
+
+# ==========================================================================
+# Command: flush
+# ==========================================================================
+
+# Force all dirty data of a backing device out to the backing disk and wait
+# until the cache is clean.
+#
+# The mechanism is bcache's own: writeback_percent is the share of the cache
+# that may stay dirty, so setting it to 0 tells the writeback thread to drain
+# everything. The original value is restored afterwards, which is why this
+# does not permanently change the caching behaviour of the device.
+flush_one() {
+    local idx="${1}"
+    local dir="${BDEV[${idx}|sysfs]}"
+    local label="${BDEV[${idx}|bcache_dev]:-${BDEV[${idx}|kernel_name]}}"
+    local dirty="${BDEV[${idx}|dirty_data]}"
+    local remaining=""
+
+    if [ -z "${BDEV[${idx}|cache_set]}" ]; then
+        msg "${label}: no cache attached, nothing to flush"
+        return 0
+    fi
+    if [ -n "${dirty}" ] && size_is_zero "${dirty}"; then
+        msg "${label}: already clean"
+        return 0
+    fi
+
+    msg "${label}: flushing ${dirty:-an unknown amount of} dirty data"
+
+    # Writeback only runs when it is enabled; a device whose writeback thread
+    # was stopped would otherwise be waited on forever.
+    if [ -e "${dir}/writeback_running" ]; then
+        remember_attribute "${dir}/writeback_running"
+        sysfs_write "${dir}/writeback_running" "1"
+    fi
+    if [ -e "${dir}/writeback_percent" ]; then
+        remember_attribute "${dir}/writeback_percent"
+        sysfs_write "${dir}/writeback_percent" "0"
+    fi
+
+    if ! wait_for_clean "${dir}" "${label}" "${TIMEOUT}"; then
+        remaining="$(sysfs_read "${dir}/dirty_data")"
+        die "${label}: still dirty after ${TIMEOUT}s (${remaining:-unknown} remaining); raise --timeout or use --timeout 0 to wait indefinitely"
+    fi
+
+    audit "flushed all dirty data of ${label} (${BDEV[${idx}|dev_path]})"
+    return 0
+}
+
+# Entry point for the flush command.
+cmd_flush() {
+    local key idx
+
+    if [ "${#DEVICE_FILTER[@]}" -eq 0 ]; then
+        die_usage "flush needs at least one device; give a bcache device, a backing device or 'all'"
+    fi
+    require_writable_sysfs
+
+    # The restore must survive every exit path, including Ctrl-C in the
+    # middle of a long writeback.
+    trap restore_attributes EXIT INT TERM
+
+    for key in "${DEVICE_FILTER[@]}"; do
+        if [ "${key}" = "all" ]; then
+            [ "${#BDEV_ORDER[@]}" -gt 0 ] || die "no bcache backing device is registered"
+            for idx in "${BDEV_ORDER[@]}"; do
+                flush_one "${idx}"
+                restore_attributes
+            done
+            continue
+        fi
+        idx="$(resolve_one_backing "${key}")"
+        flush_one "${idx}"
+        restore_attributes
+    done
+    return 0
+}
+
+# ==========================================================================
+# Command: attach
+# ==========================================================================
+
+# Attach one backing device to a cache set. Attaching is additive and
+# reversible, so it does not ask for confirmation; it does refuse to move a
+# device that is already attached somewhere else, because that would be a
+# detach in disguise.
+attach_one() {
+    local idx="${1}"
+    local uuid="${2}"
+    local dir="${BDEV[${idx}|sysfs]}"
+    local label="${BDEV[${idx}|bcache_dev]:-${BDEV[${idx}|kernel_name]}}"
+    local current="${BDEV[${idx}|cache_set]}"
+
+    if [ "${current}" = "${uuid}" ]; then
+        msg "${label}: already attached to ${uuid}"
+        return 0
+    fi
+    if [ -n "${current}" ]; then
+        die "${label} is attached to cache set ${current}; run '${SCRIPT_NAME} detach ${label}' first"
+    fi
+    if [ ! -e "${dir}/attach" ]; then
+        die "${label}: this kernel does not expose ${dir}/attach"
+    fi
+
+    sysfs_write "${dir}/attach" "${uuid}"
+    audit "attached ${BDEV[${idx}|dev_path]} (${label}) to cache set ${uuid}"
+
+    # The kernel sets the link up asynchronously; a short wait turns a
+    # silently ignored UUID into a reported failure.
+    if ! wait_for_condition "the cache link of ${label}" 10 backing_is_attached "${dir}"; then
+        warn "${label}: the cache link did not appear within 10s; check 'dmesg' for the reason"
+    fi
+    return 0
+}
+
+# Entry point for the attach command.
+cmd_attach() {
+    local uuid key idx
+
+    if [ "${#DEVICE_FILTER[@]}" -eq 0 ]; then
+        die_usage "attach needs at least one device"
+    fi
+    require_writable_sysfs
+    uuid="$(resolve_cache_set_uuid "${CACHE_TARGET}")"
+
+    for key in "${DEVICE_FILTER[@]}"; do
+        idx="$(resolve_one_backing "${key}")"
+        attach_one "${idx}" "${uuid}"
+    done
+    return 0
+}
+
+# ==========================================================================
+# Command: detach
+# ==========================================================================
+
+# Detach one backing device from its cache set. bcache writes the dirty data
+# back before it lets go, so no data is lost; the command waits for that to
+# finish rather than returning while the cache is still draining.
+detach_one() {
+    local idx="${1}"
+    local dir="${BDEV[${idx}|sysfs]}"
+    local label="${BDEV[${idx}|bcache_dev]:-${BDEV[${idx}|kernel_name]}}"
+    local uuid="${BDEV[${idx}|cache_set]}"
+    local dirty="${BDEV[${idx}|dirty_data]}"
+    local note=""
+
+    if [ -z "${uuid}" ]; then
+        msg "${label}: no cache attached, nothing to detach"
+        return 0
+    fi
+    if [ -n "${dirty}" ] && ! size_is_zero "${dirty}"; then
+        note=" ${dirty} of dirty data will be written back first, which can take a while."
+    fi
+
+    if ! confirm "Detach ${BDEV[${idx}|dev_path]} (${label}) from cache set ${uuid}?${note}"; then
+        die "aborted on user request"
+    fi
+
+    sysfs_write "${dir}/detach" "1"
+    audit "detached ${BDEV[${idx}|dev_path]} (${label}) from cache set ${uuid}"
+
+    if ! wait_for_condition "${label} to finish detaching" "${TIMEOUT}" backing_is_detached "${dir}"; then
+        die "${label}: still attached after ${TIMEOUT}s; the writeback is probably still running, raise --timeout or use --timeout 0"
+    fi
+    if [ "${DRY_RUN}" != "1" ]; then
+        msg "${label}: detached, now running uncached"
+    fi
+    return 0
+}
+
+# Entry point for the detach command.
+cmd_detach() {
+    local key idx
+
+    if [ "${#DEVICE_FILTER[@]}" -eq 0 ]; then
+        die_usage "detach needs at least one device"
+    fi
+    require_writable_sysfs
+
+    for key in "${DEVICE_FILTER[@]}"; do
+        if [ "${key}" = "all" ]; then
+            [ "${#BDEV_ORDER[@]}" -gt 0 ] || die "no bcache backing device is registered"
+            for idx in "${BDEV_ORDER[@]}"; do
+                detach_one "${idx}"
+            done
+            continue
+        fi
+        idx="$(resolve_one_backing "${key}")"
+        detach_one "${idx}"
+    done
+    return 0
+}
+
+# ==========================================================================
+# Command: stop
+# ==========================================================================
+
+# Stop a single backing device: /dev/bcacheN disappears and the backing disk
+# is released. Everything stacked on top of it must be gone first, which is
+# what the guards verify.
+stop_backing() {
+    local idx="${1}"
+    local dir="${BDEV[${idx}|sysfs]}"
+    local label="${BDEV[${idx}|bcache_dev]:-${BDEV[${idx}|kernel_name]}}"
+
+    guard_device_in_use "${idx}" "stop"
+    guard_dirty_data "${idx}" "stop"
+
+    if ! confirm "Stop ${label} (${BDEV[${idx}|dev_path]})? /dev/${label} will disappear."; then
+        die "aborted on user request"
+    fi
+
+    sysfs_write "${dir}/stop" "1"
+    audit "stopped bcache device ${label} on ${BDEV[${idx}|dev_path]}"
+
+    if [ -n "${BDEV[${idx}|bcache_dev]}" ]; then
+        if ! wait_for_condition "${label} to disappear" "${TIMEOUT}" block_device_gone "${label}"; then
+            warn "${label}: still present after ${TIMEOUT}s; check 'dmesg' for the reason"
+        fi
+    fi
+    return 0
+}
+
+# Stop a whole cache set. Every backing device attached to it loses its cache
+# at once, so each one is checked before anything is written.
+stop_cache_set() {
+    local uuid="${1}"
+    local dir idx backings
+
+    dir="$(cache_set_sysfs "${uuid}")"
+    backings="$(backing_devices_of_set "${uuid}")"
+
+    if [ "${#BDEV_ORDER[@]}" -gt 0 ]; then
+        for idx in "${BDEV_ORDER[@]}"; do
+            [ "${BDEV[${idx}|cache_set]}" = "${uuid}" ] || continue
+            guard_dirty_data "${idx}" "stop"
+        done
+    fi
+
+    if ! confirm "Stop cache set ${uuid}? The attached backing devices (${backings:-none}) lose their cache."; then
+        die "aborted on user request"
+    fi
+
+    sysfs_write "${dir}/stop" "1"
+    audit "stopped cache set ${uuid} (backing devices: ${backings:-none})"
+
+    if ! wait_for_condition "cache set ${uuid} to disappear" "${TIMEOUT}" cache_set_gone "${uuid}"; then
+        warn "cache set ${uuid} is still registered after ${TIMEOUT}s; check 'dmesg' for the reason"
+    fi
+    return 0
+}
+
+# Entry point for the stop command. A target is either a cache set UUID or a
+# backing device; the UUID is tried first because it is unambiguous.
+cmd_stop() {
+    local key idx found
+
+    if [ "${#DEVICE_FILTER[@]}" -eq 0 ]; then
+        die_usage "stop needs at least one target: a bcache device or a cache set UUID"
+    fi
+    require_writable_sysfs
+
+    for key in "${DEVICE_FILTER[@]}"; do
+        found=""
+        if [ "${#CSET_ORDER[@]}" -gt 0 ]; then
+            for idx in "${CSET_ORDER[@]}"; do
+                if [ "${CSET[${idx}|uuid]}" = "${key}" ]; then
+                    found="${key}"
+                    break
+                fi
+            done
+        fi
+        if [ -n "${found}" ]; then
+            stop_cache_set "${found}"
+            continue
+        fi
+        idx="$(resolve_one_backing "${key}")"
+        stop_backing "${idx}"
+    done
+    return 0
+}
+
+# ==========================================================================
+# Setup operations: shared machinery
+# ==========================================================================
+
+# Resolve a device path to its kernel name, following symlinks so
+# /dev/mapper/vg-lv and /dev/disk/by-id/... both end up as the name the
+# kernel uses in sysfs.
+kernel_name_of_path() {
+    local dev="${1}"
+    local target
+
+    target="$(readlink -f -- "${dev}" 2>/dev/null || printf '%s' "${dev}")"
+    printf '%s' "${target##*/}"
+}
+
+# Find the sysfs directory of a kernel device name. Whole disks live directly
+# below /sys/block, partitions one level deeper below their disk.
+sysfs_dir_for_device() {
+    local name="${1}"
+    local dir
+
+    if [ -d "${SYSFS_ROOT}/block/${name}" ]; then
+        printf '%s' "${SYSFS_ROOT}/block/${name}"
+        return 0
+    fi
+    for dir in "${SYSFS_ROOT}"/block/*/"${name}"; do
+        if [ -d "${dir}" ]; then
+            printf '%s' "${dir}"
+            return 0
+        fi
+    done
+    printf ''
+}
+
+# Report the partitions of a whole disk, one kernel name per line. A sysfs
+# child directory that carries a "partition" file is a partition; anything
+# else below a disk is an attribute directory.
+partitions_of() {
+    local sysfs="${1}"
+    local dir
+
+    for dir in "${sysfs}"/*/; do
+        [ -f "${dir}partition" ] || continue
+        dir="${dir%/}"
+        printf '%s\n' "${dir##*/}"
+    done
+}
+
+# Report the filesystem or container signature on a device, or nothing when
+# there is none. Returns non-zero when it could not be determined at all.
+#
+# blkid --probe reads the device itself. lsblk reports what udev recorded,
+# which is empty on any system where udev did not run - a container, a
+# rescue boot, an initramfs - and an empty answer there would let this guard
+# hand a fully populated disk to make-bcache. The direct probe is therefore
+# the authority and lsblk is only the fallback; if neither can answer, the
+# caller must treat that as a reason to stop, not as an all-clear.
+device_signature() {
+    local dev="${1}"
+    local out rc
+
+    if command -v blkid >/dev/null 2>&1; then
+        out="$(blkid --probe --output value --match-tag TYPE -- "${dev}" 2>/dev/null)"
+        rc="$?"
+        case "${rc}" in
+            0) printf '%s' "${out}"; return 0 ;;
+            2) printf ''; return 0 ;;
+        esac
+    fi
+    if command -v lsblk >/dev/null 2>&1; then
+        out="$(lsblk --pairs --nodeps --noheadings --output FSTYPE -- "${dev}" 2>/dev/null | head -n 1)"
+        printf '%s' "$(lsblk_field "${out}" FSTYPE)"
+        return 0
+    fi
+    printf ''
+    return 1
+}
+
+# Refuse to format a device that is not demonstrably unused.
+#
+# make-bcache overwrites the start of the device without asking, so every
+# reason to believe the device still carries something is checked first, and
+# each reason is checked at its own source rather than through one tool that
+# might be uninformed: sysfs for the bcache registration, the partitions and
+# the holders, /proc/self/mounts for the mounts, and a direct probe for the
+# signature. This is the whole point of wrapping make-bcache.
+guard_fresh_device() {
+    local dev="${1}"
+    local purpose="${2}"
+    local name sysfs signature mounts holders parts
+    local -a names=()
+
+    if [ ! -e "${dev}" ]; then
+        die "device does not exist: ${dev}"
+    fi
+    if [ ! -b "${dev}" ]; then
+        die "not a block device: ${dev}"
+    fi
+
+    name="$(kernel_name_of_path "${dev}")"
+    sysfs="$(sysfs_dir_for_device "${name}")"
+    if [ -z "${sysfs}" ]; then
+        die "no sysfs entry for ${dev}; the kernel does not know this device as ${name}"
+    fi
+    if [ -d "${sysfs}/bcache" ]; then
+        die "${dev} is already registered with bcache; stop it with '${SCRIPT_NAME} stop' before reusing it"
+    fi
+
+    # Partitions and holders both mean the device is the base of a stack.
+    mapfile -t names < <(partitions_of "${sysfs}")
+    parts=""
+    if [ "${#names[@]}" -gt 0 ]; then
+        parts="${names[*]}"
+    fi
+    holders="$(holders_of "${name}")"
+
+    # A mount anywhere in that stack is the most conclusive evidence of use,
+    # so the device and all of its partitions are checked together.
+    names+=("${name}")
+    mounts="$(mount_points_of_names "${names[@]}")"
+
+    if [ -n "${mounts}" ]; then
+        die "refusing to use ${dev} as a ${purpose}: it or a partition of it is mounted on ${mounts}"
+    fi
+    if [ -n "${parts}" ]; then
+        if [ "${FORCE}" != "1" ]; then
+            die "refusing to use ${dev} as a ${purpose}: it is partitioned (${parts// /, }); use a partition instead, or pass --force"
+        fi
+        warn "${dev} is partitioned (${parts// /, }) and is being formatted anyway because --force was given"
+    fi
+    if [ -n "${holders}" ]; then
+        if [ "${FORCE}" != "1" ]; then
+            die "refusing to use ${dev} as a ${purpose}: it is in use by ${holders}; dismantle that layer first or pass --force"
+        fi
+        warn "${dev} is in use by ${holders} and is being formatted anyway because --force was given"
+    fi
+
+    if ! signature="$(device_signature "${dev}")"; then
+        if [ "${FORCE}" != "1" ]; then
+            die "refusing to use ${dev} as a ${purpose}: neither blkid nor lsblk is available, so it cannot be shown to be empty; install util-linux or pass --force"
+        fi
+        warn "${dev} could not be probed for a signature and is being formatted anyway because --force was given"
+        signature=""
+    fi
+    if [ -n "${signature}" ]; then
+        if [ "${signature}" = "bcache" ]; then
+            if [ "${DO_WIPE}" != "1" ]; then
+                die "${dev} already carries a bcache superblock; pass --wipe to overwrite it"
+            fi
+        elif [ "${FORCE}" != "1" ]; then
+            die "refusing to use ${dev} as a ${purpose}: it carries a ${signature} signature; wipe it yourself or pass --force"
+        else
+            warn "${dev} carries a ${signature} signature and is being overwritten because --force was given"
+        fi
+    fi
+    return 0
+}
+
+# Register a device with the kernel so it becomes a bcache member.
+#
+# udev registers new devices too, so this races with it. Losing that race is
+# success, not failure: the only thing that matters is that the device is
+# registered afterwards.
+register_device() {
+    local dev="${1}"
+    local name sysfs err_output
+
+    name="$(kernel_name_of_path "${dev}")"
+    sysfs="$(sysfs_dir_for_device "${name}")"
+    if [ -n "${sysfs}" ] && [ -d "${sysfs}/bcache" ]; then
+        vmsg "${dev} is already registered"
+        return 0
+    fi
+    if [ "${DRY_RUN}" = "1" ]; then
+        msg "would register ${dev} with the kernel"
+        return 0
+    fi
+
+    vmsg "registering ${dev}"
+    if ! err_output="$( { printf '%s' "${dev}" >"${SYSFS_ROOT}/fs/bcache/register"; } 2>&1 )"; then
+        sysfs="$(sysfs_dir_for_device "${name}")"
+        if [ -n "${sysfs}" ] && [ -d "${sysfs}/bcache" ]; then
+            vmsg "${dev} was registered by udev in parallel"
+            return 0
+        fi
+        die "registering ${dev} failed: ${err_output:-unknown error}"
+    fi
+    audit "registered ${dev} with the kernel"
+    return 0
+}
+
+# True once a registered cache device has joined a cache set. The "set" link
+# of the device names the set it joined, which is the only reliable way to
+# learn the UUID that make-bcache generated for a brand new cache.
+cache_device_joined_set() {
+    [ -L "${1}/bcache/set" ]
+}
+
+# ==========================================================================
+# Command: make
+# ==========================================================================
+
+# Create backing and cache devices with make-bcache after verifying that
+# every target is really free.
+cmd_make() {
+    local -a args=()
+    local dev mode name sysfs targets
+
+    if [ "${#MAKE_BACKING[@]}" -eq 0 ] && [ "${#MAKE_CACHE[@]}" -eq 0 ]; then
+        die_usage "make needs at least one device: -B for a backing device, -C for a cache device"
+    fi
+    if ! command -v make-bcache >/dev/null 2>&1; then
+        die "make-bcache not found; install bcache-tools"
+    fi
+    require_writable_sysfs
+
+    # Check every device before touching any of them, so a rejected second
+    # device does not leave a half-finished setup behind.
+    if [ "${#MAKE_BACKING[@]}" -gt 0 ]; then
+        for dev in "${MAKE_BACKING[@]}"; do
+            guard_fresh_device "${dev}" "backing device"
+        done
+    fi
+    if [ "${#MAKE_CACHE[@]}" -gt 0 ]; then
+        for dev in "${MAKE_CACHE[@]}"; do
+            guard_fresh_device "${dev}" "cache device"
+        done
+    fi
+
+    if [ -n "${BLOCK_SIZE}" ]; then
+        args+=(--block "${BLOCK_SIZE}")
+    fi
+    if [ -n "${BUCKET_SIZE}" ]; then
+        args+=(--bucket "${BUCKET_SIZE}")
+    fi
+    if [ "${DO_WIPE}" = "1" ]; then
+        args+=(--wipe-bcache)
+    fi
+    # make-bcache only knows the writeback switch; the other modes are set
+    # through sysfs once the device is registered.
+    if [ "${CACHE_MODE_ARG}" = "writeback" ]; then
+        args+=(--writeback)
+    fi
+    if [ "${#MAKE_CACHE[@]}" -gt 0 ]; then
+        args+=(-C "${MAKE_CACHE[@]}")
+    fi
+    if [ "${#MAKE_BACKING[@]}" -gt 0 ]; then
+        args+=(-B "${MAKE_BACKING[@]}")
+    fi
+
+    targets=""
+    if [ "${#MAKE_BACKING[@]}" -gt 0 ]; then
+        targets="${MAKE_BACKING[*]}"
+    fi
+    if [ "${#MAKE_CACHE[@]}" -gt 0 ]; then
+        targets="${targets}${targets:+ }${MAKE_CACHE[*]}"
+    fi
+
+    msg "About to run: make-bcache ${args[*]}"
+    if ! confirm "This erases all data on ${targets}. Continue?"; then
+        die "aborted on user request"
+    fi
+
+    run_external make-bcache "${args[@]}"
+    audit "created bcache devices with: make-bcache ${args[*]}"
+
+    if [ "${DO_REGISTER}" != "1" ]; then
+        msg "Devices created. Registration was skipped (--no-register)."
+        return 0
+    fi
+
+    # make-bcache leaves registration to udev, which may or may not be
+    # active. Doing it explicitly makes the result the same either way.
+    if [ "${#MAKE_CACHE[@]}" -gt 0 ]; then
+        for dev in "${MAKE_CACHE[@]}"; do
+            register_device "${dev}"
+        done
+    fi
+    if [ "${#MAKE_BACKING[@]}" -gt 0 ]; then
+        for dev in "${MAKE_BACKING[@]}"; do
+            register_device "${dev}"
+        done
+    fi
+
+    # Every cache mode except writeback has to be set afterwards, because
+    # make-bcache cannot express it.
+    mode="${CACHE_MODE_ARG}"
+    if [ -n "${mode}" ] && [ "${mode}" != "writeback" ] && [ "${#MAKE_BACKING[@]}" -gt 0 ]; then
+        for dev in "${MAKE_BACKING[@]}"; do
+            name="$(kernel_name_of_path "${dev}")"
+            sysfs="$(sysfs_dir_for_device "${name}")"
+            if [ "${DRY_RUN}" = "1" ]; then
+                msg "would set cache_mode of ${dev} to ${mode}"
+                continue
+            fi
+            if [ -z "${sysfs}" ] || [ ! -e "${sysfs}/bcache/cache_mode" ]; then
+                warn "${dev}: cannot set cache_mode to ${mode}, the device is not registered as a backing device"
+                continue
+            fi
+            sysfs_write "${sysfs}/bcache/cache_mode" "${mode}"
+            audit "set cache_mode of ${dev} to ${mode}"
+        done
+    fi
+
+    msg ""
+    msg "Done. Run '${SCRIPT_NAME} status' to see the new devices."
+    return 0
+}
+
+# ==========================================================================
+# Command: replace
+# ==========================================================================
+
+# Replace the cache device of a cache set without losing data.
+#
+# The order of the steps is what makes this safe: the backing devices are
+# taken out of writeback first so no new dirty data appears, the existing
+# dirty data is flushed and only then is anything detached or stopped. Every
+# step is a no-op when it is already true, so an interrupted run can simply
+# be started again.
+cmd_replace() {
+    local uuid old_caches backings dir idx i
+    local -a members=() saved_modes=()
+    local new_uuid="" new_name new_sysfs
+
+    if [ -z "${NEW_CACHE_DEVICE}" ]; then
+        die_usage "replace needs the new cache device: --new DEVICE"
+    fi
+    if ! command -v make-bcache >/dev/null 2>&1; then
+        die "make-bcache not found; install bcache-tools"
+    fi
+    require_writable_sysfs
+
+    uuid="$(resolve_cache_set_uuid "${CACHE_SET_TARGET}")"
+    old_caches="$(cache_devices_of_set "${uuid}")"
+    backings="$(backing_devices_of_set "${uuid}")"
+    guard_fresh_device "${NEW_CACHE_DEVICE}" "cache device"
+
+    if [ "${#BDEV_ORDER[@]}" -gt 0 ]; then
+        for idx in "${BDEV_ORDER[@]}"; do
+            if [ "${BDEV[${idx}|cache_set]}" = "${uuid}" ]; then
+                members+=("${idx}")
+                saved_modes+=("${BDEV[${idx}|cache_mode]}")
+            fi
+        done
+    fi
+
+    msg "Replacing the cache device of cache set ${uuid}"
+    msg "  current cache devices : ${old_caches:-none}"
+    msg "  new cache device      : ${NEW_CACHE_DEVICE}"
+    msg "  backing devices       : ${backings:-none}"
+    msg ""
+    msg "Steps: switch the backing devices to writethrough, flush their dirty"
+    msg "data, detach them, stop the old cache set, create and register the new"
+    msg "cache device, re-attach every backing device and restore its cache mode."
+    msg ""
+
+    if ! confirm "This erases all data on ${NEW_CACHE_DEVICE} and drops the old cache. Continue?"; then
+        die "aborted on user request"
+    fi
+
+    # The operator confirmed the whole plan; the individual steps below must
+    # not ask again in the middle of a running migration.
+    ASSUME_YES=1
+
+    # Step 2 below lowers writeback_percent to drain the caches. Interrupting
+    # the migration between that and the restore would leave write caching
+    # disabled on every device, so the restore is wired to an exit trap here
+    # for the same reason it is in "flush".
+    trap restore_attributes EXIT INT TERM
+
+    # Step 1: stop producing new dirty data.
+    if [ "${#members[@]}" -gt 0 ]; then
+        for idx in "${members[@]}"; do
+            dir="${BDEV[${idx}|sysfs]}"
+            if [ "${BDEV[${idx}|cache_mode]}" = "writeback" ]; then
+                sysfs_write "${dir}/cache_mode" "writethrough"
+                audit "set cache_mode of ${BDEV[${idx}|bcache_dev]:-${BDEV[${idx}|kernel_name]}} to writethrough for the cache replacement"
+            fi
+        done
+    fi
+
+    # Step 2: get the dirty data onto the backing disks.
+    if [ "${#members[@]}" -gt 0 ]; then
+        for idx in "${members[@]}"; do
+            flush_one "${idx}"
+            restore_attributes
+        done
+    fi
+
+    # Step 3 and 4: release the old cache set.
+    if [ "${#members[@]}" -gt 0 ]; then
+        for idx in "${members[@]}"; do
+            detach_one "${idx}"
+        done
+    fi
+    if ! cache_set_gone "${uuid}"; then
+        stop_cache_set "${uuid}"
+    fi
+
+    # Step 5 and 6: build the replacement and let the kernel see it.
+    local -a make_args=()
+    if [ -n "${BLOCK_SIZE}" ]; then
+        make_args+=(--block "${BLOCK_SIZE}")
+    fi
+    if [ -n "${BUCKET_SIZE}" ]; then
+        make_args+=(--bucket "${BUCKET_SIZE}")
+    fi
+    if [ "${DO_WIPE}" = "1" ]; then
+        make_args+=(--wipe-bcache)
+    fi
+    make_args+=(-C "${NEW_CACHE_DEVICE}")
+
+    run_external make-bcache "${make_args[@]}"
+    audit "created the replacement cache device: make-bcache ${make_args[*]}"
+    register_device "${NEW_CACHE_DEVICE}"
+
+    if [ "${DRY_RUN}" = "1" ]; then
+        msg ""
+        msg "Dry run: the new cache set would now be attached to ${backings:-the backing devices}."
+        return 0
+    fi
+
+    # Step 7: learn the UUID the kernel gave the new set. make-bcache
+    # generates it, so it can only be read back from the device itself.
+    new_name="$(kernel_name_of_path "${NEW_CACHE_DEVICE}")"
+    new_sysfs="$(sysfs_dir_for_device "${new_name}")"
+    if [ -z "${new_sysfs}" ]; then
+        die "no sysfs entry for the new cache device ${NEW_CACHE_DEVICE}"
+    fi
+    if ! wait_for_condition "the new cache set to appear" 30 cache_device_joined_set "${new_sysfs}"; then
+        die "${NEW_CACHE_DEVICE} did not join a cache set within 30s; check 'dmesg'"
+    fi
+    new_uuid="$(sysfs_link_name "${new_sysfs}/bcache/set")"
+    if [ -z "${new_uuid}" ]; then
+        die "could not identify the new cache set; attach the backing devices manually with '${SCRIPT_NAME} attach'"
+    fi
+    msg "New cache set: ${new_uuid}"
+
+    # Step 8: re-attach and put the original cache modes back.
+    if [ "${#members[@]}" -gt 0 ]; then
+        for i in "${!members[@]}"; do
+            idx="${members[i]}"
+            dir="${BDEV[${idx}|sysfs]}"
+            sysfs_write "${dir}/attach" "${new_uuid}"
+            audit "attached ${BDEV[${idx}|dev_path]} to the new cache set ${new_uuid}"
+            if [ -n "${saved_modes[i]}" ]; then
+                sysfs_write "${dir}/cache_mode" "${saved_modes[i]}"
+                audit "restored cache_mode of ${BDEV[${idx}|bcache_dev]:-${BDEV[${idx}|kernel_name]}} to ${saved_modes[i]}"
+            fi
+        done
+    fi
+
+    msg ""
+    msg "Cache device replaced. Run '${SCRIPT_NAME} status' to verify."
+    return 0
+}
+
+# ==========================================================================
 # Argument parsing
 # ==========================================================================
 
-while [ "$#" -gt 0 ]; do
-    case "${1}" in
-        -j|--json)
-            JSON_OUTPUT=1
-            shift
-            ;;
-        -l|--long)
-            LONG_OUTPUT=1
-            shift
-            ;;
-        -m|--min-available)
-            if [ "$#" -lt 2 ]; then
-                die_usage "option ${1} requires an argument"
-            fi
-            MIN_AVAILABLE="${2}"
-            shift 2
-            ;;
-        --min-available=*)
-            MIN_AVAILABLE="${1#*=}"
-            shift
-            ;;
-        -r|--sysfs-root)
-            if [ "$#" -lt 2 ]; then
-                die_usage "option ${1} requires an argument"
-            fi
-            SYSFS_ROOT="${2}"
-            shift 2
-            ;;
-        --sysfs-root=*)
-            SYSFS_ROOT="${1#*=}"
-            shift
-            ;;
-        --color)
-            if [ "$#" -lt 2 ]; then
-                die_usage "option ${1} requires an argument"
-            fi
-            COLOR_MODE="${2}"
-            shift 2
-            ;;
-        --color=*)
-            COLOR_MODE="${1#*=}"
-            shift
-            ;;
-        --no-color)
-            COLOR_MODE="never"
-            shift
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        -V|--version)
-            printf '%s %s\n' "${SCRIPT_NAME}" "${SCRIPT_VERSION}"
-            exit 0
-            ;;
-        --)
-            shift
-            break
-            ;;
-        -*)
-            die_usage "unknown option: ${1}"
-            ;;
-        *)
-            # The first positional argument is the command, everything after
-            # it is a device filter.
-            if [ -z "${COMMAND}" ]; then
-                COMMAND="${1}"
-            else
-                DEVICE_FILTER+=("${1}")
-            fi
-            shift
-            ;;
-    esac
-done
+# Read the command line into the CLI_* holders, to be merged with the other
+# layers afterwards. Options without a configuration-file layer are assigned
+# directly, because for them "environment, then command line" is already the
+# complete precedence.
+parse_arguments() {
+    while [ "$#" -gt 0 ]; do
+        case "${1}" in
+            -j|--json)
+                CLI_JSON=1
+                shift
+                ;;
+            -l|--long)
+                CLI_LONG=1
+                shift
+                ;;
+            -v|--verbose)
+                CLI_VERBOSE=1
+                VERBOSE=1
+                shift
+                ;;
+            -n|--dry-run)
+                CLI_DRY_RUN=1
+                shift
+                ;;
+            -y|--yes)
+                ASSUME_YES=1
+                shift
+                ;;
+            -f|--force)
+                FORCE=1
+                shift
+                ;;
+            -m|--min-available)
+                if [ "$#" -lt 2 ]; then
+                    die_usage "option ${1} requires an argument"
+                fi
+                CLI_MIN_AVAILABLE="${2}"
+                shift 2
+                ;;
+            --min-available=*)
+                CLI_MIN_AVAILABLE="${1#*=}"
+                shift
+                ;;
+            -t|--timeout)
+                if [ "$#" -lt 2 ]; then
+                    die_usage "option ${1} requires an argument"
+                fi
+                CLI_TIMEOUT="${2}"
+                shift 2
+                ;;
+            --timeout=*)
+                CLI_TIMEOUT="${1#*=}"
+                shift
+                ;;
+            -r|--sysfs-root)
+                if [ "$#" -lt 2 ]; then
+                    die_usage "option ${1} requires an argument"
+                fi
+                CLI_SYSFS_ROOT="${2}"
+                shift 2
+                ;;
+            --sysfs-root=*)
+                CLI_SYSFS_ROOT="${1#*=}"
+                shift
+                ;;
+            --config)
+                if [ "$#" -lt 2 ]; then
+                    die_usage "option ${1} requires an argument"
+                fi
+                CLI_CONFIG="${2}"
+                shift 2
+                ;;
+            --config=*)
+                CLI_CONFIG="${1#*=}"
+                shift
+                ;;
+            --color)
+                if [ "$#" -lt 2 ]; then
+                    die_usage "option ${1} requires an argument"
+                fi
+                CLI_COLOR="${2}"
+                shift 2
+                ;;
+            --color=*)
+                CLI_COLOR="${1#*=}"
+                shift
+                ;;
+            --no-color)
+                CLI_COLOR="never"
+                shift
+                ;;
+            -c|--cache)
+                if [ "$#" -lt 2 ]; then
+                    die_usage "option ${1} requires an argument"
+                fi
+                CACHE_TARGET="${2}"
+                shift 2
+                ;;
+            --cache=*)
+                CACHE_TARGET="${1#*=}"
+                shift
+                ;;
+            -B|--backing)
+                if [ "$#" -lt 2 ]; then
+                    die_usage "option ${1} requires an argument"
+                fi
+                MAKE_BACKING+=("${2}")
+                shift 2
+                ;;
+            --backing=*)
+                MAKE_BACKING+=("${1#*=}")
+                shift
+                ;;
+            -C|--cache-device)
+                if [ "$#" -lt 2 ]; then
+                    die_usage "option ${1} requires an argument"
+                fi
+                MAKE_CACHE+=("${2}")
+                shift 2
+                ;;
+            --cache-device=*)
+                MAKE_CACHE+=("${1#*=}")
+                shift
+                ;;
+            --cache-mode)
+                if [ "$#" -lt 2 ]; then
+                    die_usage "option ${1} requires an argument"
+                fi
+                CACHE_MODE_ARG="${2}"
+                shift 2
+                ;;
+            --cache-mode=*)
+                CACHE_MODE_ARG="${1#*=}"
+                shift
+                ;;
+            --bucket-size)
+                if [ "$#" -lt 2 ]; then
+                    die_usage "option ${1} requires an argument"
+                fi
+                BUCKET_SIZE="${2}"
+                shift 2
+                ;;
+            --bucket-size=*)
+                BUCKET_SIZE="${1#*=}"
+                shift
+                ;;
+            --block-size)
+                if [ "$#" -lt 2 ]; then
+                    die_usage "option ${1} requires an argument"
+                fi
+                BLOCK_SIZE="${2}"
+                shift 2
+                ;;
+            --block-size=*)
+                BLOCK_SIZE="${1#*=}"
+                shift
+                ;;
+            --cache-set)
+                if [ "$#" -lt 2 ]; then
+                    die_usage "option ${1} requires an argument"
+                fi
+                CACHE_SET_TARGET="${2}"
+                shift 2
+                ;;
+            --cache-set=*)
+                CACHE_SET_TARGET="${1#*=}"
+                shift
+                ;;
+            --new)
+                if [ "$#" -lt 2 ]; then
+                    die_usage "option ${1} requires an argument"
+                fi
+                NEW_CACHE_DEVICE="${2}"
+                shift 2
+                ;;
+            --new=*)
+                NEW_CACHE_DEVICE="${1#*=}"
+                shift
+                ;;
+            --wipe)
+                DO_WIPE=1
+                shift
+                ;;
+            --no-register)
+                DO_REGISTER=0
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -V|--version)
+                printf '%s %s\n' "${SCRIPT_NAME}" "${SCRIPT_VERSION}"
+                exit 0
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                die_usage "unknown option: ${1}"
+                ;;
+            *)
+                # The first positional argument is the command, everything after
+                # it is a device argument.
+                if [ -z "${COMMAND}" ]; then
+                    COMMAND="${1}"
+                else
+                    DEVICE_FILTER+=("${1}")
+                fi
+                shift
+                ;;
+        esac
+    done
 
-# Remaining arguments after "--" are device filters as well.
-while [ "$#" -gt 0 ]; do
-    if [ -z "${COMMAND}" ]; then
-        COMMAND="${1}"
+    # Remaining arguments after "--" are device arguments as well.
+    while [ "$#" -gt 0 ]; do
+        if [ -z "${COMMAND}" ]; then
+            COMMAND="${1}"
+        else
+            DEVICE_FILTER+=("${1}")
+        fi
+        shift
+    done
+}
+
+# ==========================================================================
+# Settings resolution
+# ==========================================================================
+
+# Pick the first non-empty value, which yields the documented precedence
+# command line > environment > configuration file > built-in default.
+resolve_setting() {
+    local cli="${1}"
+    local from_env="${2}"
+    local from_config="${3}"
+    local fallback="${4}"
+
+    if [ -n "${cli}" ]; then
+        printf '%s' "${cli}"
+    elif [ -n "${from_env}" ]; then
+        printf '%s' "${from_env}"
+    elif [ -n "${from_config}" ]; then
+        printf '%s' "${from_config}"
     else
-        DEVICE_FILTER+=("${1}")
+        printf '%s' "${fallback}"
     fi
-    shift
-done
+}
+
+# Split a comma separated environment variable, printing one trimmed item
+# per line. Used for the list valued options, which have no other way of
+# being passed by variable. It prints rather than filling an array by
+# reference, so the script keeps working on bash 4.2, which has no namerefs.
+split_csv() {
+    local raw="${1}"
+    local -a items=()
+    local item
+
+    [ -n "${raw}" ] || return 0
+    IFS=',' read -r -a items <<<"${raw}"
+    for item in "${items[@]}"; do
+        item="${item#"${item%%[![:space:]]*}"}"
+        item="${item%"${item##*[![:space:]]}"}"
+        if [ -n "${item}" ]; then
+            printf '%s\n' "${item}"
+        fi
+    done
+    return 0
+}
+
+# Merge the four layers into the effective settings.
+resolve_settings() {
+    local cfg_sysfs_root cfg_json cfg_long cfg_verbose cfg_color
+    local cfg_min_available cfg_timeout cfg_dry_run
+    local keep_yes keep_force verbose_bootstrap
+
+    # --yes and --force are deliberately not part of the configuration file
+    # layer: a file that silently disarms the confirmation prompts would
+    # defeat the guards of every destructive command. Sourcing lets a file
+    # assign any variable, so both are saved across the load and put back.
+    keep_yes="${ASSUME_YES}"
+    keep_force="${FORCE}"
+
+    # Blank everything the file may legitimately set, so "still empty
+    # afterwards" reliably means "not set by the configuration".
+    verbose_bootstrap="${VERBOSE}"
+    SYSFS_ROOT=""
+    JSON_OUTPUT=""
+    LONG_OUTPUT=""
+    VERBOSE=""
+    COLOR_MODE=""
+    MIN_AVAILABLE=""
+    TIMEOUT=""
+    DRY_RUN=""
+
+    load_config "$(resolve_setting "${CLI_CONFIG}" "${BCACHEMGMT_CONFIG:-}" "" "")"
+
+    cfg_sysfs_root="${SYSFS_ROOT}"
+    cfg_json="${JSON_OUTPUT}"
+    cfg_long="${LONG_OUTPUT}"
+    cfg_verbose="${VERBOSE}"
+    cfg_color="${COLOR_MODE}"
+    cfg_min_available="${MIN_AVAILABLE}"
+    cfg_timeout="${TIMEOUT}"
+    cfg_dry_run="${DRY_RUN}"
+
+    ASSUME_YES="${keep_yes}"
+    FORCE="${keep_force}"
+
+    SYSFS_ROOT="$(resolve_setting "${CLI_SYSFS_ROOT}" "${BCACHEMGMT_SYSFS_ROOT:-}" "${cfg_sysfs_root}" "${DEFAULT_SYSFS_ROOT}")"
+    JSON_OUTPUT="$(resolve_setting "${CLI_JSON}" "${BCACHEMGMT_JSON:-}" "${cfg_json}" "${DEFAULT_JSON}")"
+    LONG_OUTPUT="$(resolve_setting "${CLI_LONG}" "${BCACHEMGMT_LONG:-}" "${cfg_long}" "${DEFAULT_LONG}")"
+    VERBOSE="$(resolve_setting "${CLI_VERBOSE}" "${BCACHEMGMT_VERBOSE:-}" "${cfg_verbose}" "${verbose_bootstrap}")"
+    COLOR_MODE="$(resolve_setting "${CLI_COLOR}" "${BCACHEMGMT_COLOR:-}" "${cfg_color}" "${DEFAULT_COLOR}")"
+    MIN_AVAILABLE="$(resolve_setting "${CLI_MIN_AVAILABLE}" "${BCACHEMGMT_MIN_AVAILABLE:-}" "${cfg_min_available}" "${DEFAULT_MIN_AVAILABLE}")"
+    TIMEOUT="$(resolve_setting "${CLI_TIMEOUT}" "${BCACHEMGMT_TIMEOUT:-}" "${cfg_timeout}" "${DEFAULT_TIMEOUT}")"
+    DRY_RUN="$(resolve_setting "${CLI_DRY_RUN}" "${BCACHEMGMT_DRY_RUN:-}" "${cfg_dry_run}" "${DEFAULT_DRY_RUN}")"
+}
+
+# Reject an invalid configuration before a single device is touched. Every
+# message names the option, the offending value and what was expected.
+validate_settings() {
+    local name value
+
+    for name in JSON_OUTPUT LONG_OUTPUT VERBOSE DRY_RUN ASSUME_YES FORCE DO_REGISTER DO_WIPE; do
+        value="${!name}"
+        case "${value}" in
+            0|1) ;;
+            *) die_usage "invalid value for ${name}: '${value}' (expected 0 or 1)" ;;
+        esac
+    done
+    if ! [[ "${MIN_AVAILABLE}" =~ ^[0-9]+$ ]] || [ "${MIN_AVAILABLE}" -gt 100 ]; then
+        die_usage "invalid value for --min-available / BCACHEMGMT_MIN_AVAILABLE: ${MIN_AVAILABLE} (expected 0 to 100)"
+    fi
+    if ! [[ "${TIMEOUT}" =~ ^[0-9]+$ ]]; then
+        die_usage "invalid value for --timeout / BCACHEMGMT_TIMEOUT: ${TIMEOUT} (expected a number of seconds, 0 to wait indefinitely)"
+    fi
+    if [ -n "${CACHE_MODE_ARG}" ]; then
+        case "${CACHE_MODE_ARG}" in
+            writethrough|writeback|writearound|none) ;;
+            *) die_usage "invalid value for --cache-mode / BCACHEMGMT_CACHE_MODE: ${CACHE_MODE_ARG} (expected writethrough, writeback, writearound or none)" ;;
+        esac
+    fi
+    SYSFS_ROOT="${SYSFS_ROOT%/}"
+    if [ -z "${SYSFS_ROOT}" ] || [ ! -d "${SYSFS_ROOT}" ]; then
+        die "sysfs root does not exist: ${SYSFS_ROOT}"
+    fi
+}
 
 # ==========================================================================
 # Main
 # ==========================================================================
 
 main() {
-    # Validate the resolved configuration before touching any device.
-    case "${JSON_OUTPUT}" in
-        0|1) ;;
-        *) die_usage "invalid value for --json / BCACHEMGMT_JSON: ${JSON_OUTPUT} (expected 0 or 1)" ;;
-    esac
-    case "${LONG_OUTPUT}" in
-        0|1) ;;
-        *) die_usage "invalid value for --long / BCACHEMGMT_LONG: ${LONG_OUTPUT} (expected 0 or 1)" ;;
-    esac
-    if ! [[ "${MIN_AVAILABLE}" =~ ^[0-9]+$ ]] || [ "${MIN_AVAILABLE}" -gt 100 ]; then
-        die_usage "invalid value for --min-available / BCACHEMGMT_MIN_AVAILABLE: ${MIN_AVAILABLE} (expected 0 to 100)"
+    # The list valued options fall back to their environment variables, but
+    # only when the command line named no device at all: mixing the two
+    # layers would silently format a device the caller did not ask for.
+    if [ "${#MAKE_BACKING[@]}" -eq 0 ] && [ -n "${BCACHEMGMT_BACKING:-}" ]; then
+        mapfile -t MAKE_BACKING < <(split_csv "${BCACHEMGMT_BACKING}")
     fi
-    SYSFS_ROOT="${SYSFS_ROOT%/}"
-    [ -n "${SYSFS_ROOT}" ] && [ -d "${SYSFS_ROOT}" ] || die "sysfs root does not exist: ${SYSFS_ROOT}"
+    if [ "${#MAKE_CACHE[@]}" -eq 0 ] && [ -n "${BCACHEMGMT_CACHE_DEVICES:-}" ]; then
+        mapfile -t MAKE_CACHE < <(split_csv "${BCACHEMGMT_CACHE_DEVICES}")
+    fi
+
+    # help and version must work even when the configuration is broken or the
+    # bcache module is missing, so they are answered before anything is read.
+    case "${COMMAND}" in
+        help) usage; exit 0 ;;
+        version) printf '%s %s\n' "${SCRIPT_NAME}" "${SCRIPT_VERSION}"; exit 0 ;;
+    esac
+
+    resolve_settings
+    validate_settings
+
     if [ "${SYSFS_ROOT}" = "/sys" ]; then
         LIVE_SYSTEM=1
     fi
-
     setup_color
 
     if [ -z "${COMMAND}" ]; then
@@ -1373,27 +3917,40 @@ main() {
     fi
 
     case "${COMMAND}" in
-        help)
-            usage
-            exit 0
-            ;;
-        version)
-            printf '%s %s\n' "${SCRIPT_NAME}" "${SCRIPT_VERSION}"
-            exit 0
-            ;;
-        status|doctor) ;;
-        *)
-            die_usage "unknown command: ${COMMAND}"
+        status|doctor|diff|apply|flush|attach|detach|stop|make|replace) ;;
+        *) die_usage "unknown command: ${COMMAND}" ;;
+    esac
+
+    # Everything that changes a device switches the syslog trail on and, in a
+    # dry run, says so once instead of per line.
+    case "${COMMAND}" in
+        apply|flush|attach|detach|stop|make|replace)
+            WRITE_COMMAND=1
+            if [ "${DRY_RUN}" = "1" ]; then
+                msg "Dry run: nothing will be changed."
+                msg ""
+            fi
             ;;
     esac
 
-    # The bcache interface is a hard requirement for status; doctor reports
-    # its absence as a finding instead, so it stays usable for diagnosis.
-    if [ "${COMMAND}" = "status" ] && [ ! -d "${SYSFS_ROOT}/fs/bcache" ]; then
+    # "make" and "replace" name their devices with options, so a positional
+    # argument there is a mistake worth reporting rather than ignoring.
+    case "${COMMAND}" in
+        make|replace)
+            if [ "${#DEVICE_FILTER[@]}" -gt 0 ]; then
+                die_usage "${COMMAND} takes no device arguments; use -B/-C for 'make' and --cache-set/--new for 'replace'"
+            fi
+            ;;
+    esac
+
+    # The bcache interface is a hard requirement for every command that works
+    # with devices; doctor reports its absence as a finding instead, so it
+    # stays usable for exactly that diagnosis.
+    if [ "${COMMAND}" != "doctor" ] && [ ! -d "${SYSFS_ROOT}/fs/bcache" ]; then
         die "bcache sysfs interface not found at ${SYSFS_ROOT}/fs/bcache; is the bcache module loaded?"
     fi
 
-    # Collect everything once; both commands work on the same snapshot.
+    # Collect everything once; every command works on the same snapshot.
     if [ "${LIVE_SYSTEM}" -eq 1 ]; then
         build_byid_map
     fi
@@ -1402,9 +3959,24 @@ main() {
     collect_usage
 
     case "${COMMAND}" in
-        status) cmd_status ;;
-        doctor) cmd_doctor ;;
+        status)  cmd_status ;;
+        doctor)  cmd_doctor ;;
+        diff)    cmd_diff ;;
+        apply)   cmd_apply ;;
+        flush)   cmd_flush ;;
+        attach)  cmd_attach ;;
+        detach)  cmd_detach ;;
+        stop)    cmd_stop ;;
+        make)    cmd_make ;;
+        replace) cmd_replace ;;
     esac
 }
 
-main
+# Everything above is definitions. Reading the command line and running a
+# command happens only when the script is executed, not when it is sourced,
+# so the test suite can pull the functions in and exercise them one by one
+# without the script immediately trying to run a command.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    parse_arguments "$@"
+    main
+fi
