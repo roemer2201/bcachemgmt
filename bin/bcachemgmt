@@ -24,16 +24,17 @@
 #   4. Enrich the collected data with stable names (/dev/disk/by-id) and with
 #      filesystem usage information (lsblk).
 #   5. Run the requested command:
-#        status   -> render the overview (table or JSON)
-#        doctor   -> run the health checks and render the findings
-#        diff     -> compare the configured desired state against reality
-#        apply    -> write the desired state to sysfs
-#        flush    -> force writeback of dirty data and wait for it
-#        attach   -> attach backing devices to a cache set
-#        detach   -> detach backing devices from their cache set
-#        stop     -> stop a backing device or a whole cache set
-#        make     -> guarded make-bcache wrapper for new devices
-#        replace  -> guided replacement of a cache device
+#        status         -> render the overview (table or JSON)
+#        doctor         -> run the health checks and render the findings
+#        diff           -> compare the desired state against reality
+#        apply          -> write the desired state to sysfs
+#        set-cache-mode -> switch the cache mode of an existing device
+#        flush          -> force writeback of dirty data and wait for it
+#        attach         -> attach backing devices to a cache set
+#        detach         -> detach backing devices from their cache set
+#        stop           -> stop a backing device or a whole cache set
+#        make           -> guarded make-bcache wrapper for new devices
+#        replace        -> guided replacement of a cache device
 #   6. Exit 0 when there is nothing to report, non-zero on findings or errors.
 #
 # Usage:
@@ -41,6 +42,7 @@
 #   bcachemgmt doctor  [-j] [-m PERCENT]
 #   bcachemgmt diff    [-j] [DEVICE ...]
 #   bcachemgmt apply   [-n] [DEVICE ...]
+#   bcachemgmt set-cache-mode [-n] --cache-mode MODE DEVICE ...
 #   bcachemgmt flush   [-n] [-t SECONDS] DEVICE ...
 #   bcachemgmt attach  [-n] [-c CACHE] DEVICE ...
 #   bcachemgmt detach  [-n] [-y] [-t SECONDS] DEVICE ...
@@ -54,7 +56,7 @@
 #   reporting and required for the guards of "make". "bcache-tools" is
 #   required for "make" and "replace" only.
 #
-# Version: 1.1.0  (2026-08-27)
+# Version: 1.2.0  (2026-08-28)
 
 # Robustness baseline. Sysfs reads that are allowed to fail are handled
 # explicitly inside sysfs_read().
@@ -71,7 +73,7 @@ set -euo pipefail
 shopt -s nullglob
 
 SCRIPT_NAME="$(basename -- "${0}")"
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 
 # Name of the configuration file this script understands. Defined here so it
 # is easy to find and change.
@@ -179,6 +181,10 @@ Reporting commands (read-only):
 Changing commands (every one of them supports --dry-run):
   apply             Write the desired state from the configuration file to
                     sysfs. Only attributes that actually differ are written.
+  set-cache-mode DEVICE ...
+                    Switch the cache mode of an already existing backing
+                    device (--cache-mode). Only cache_mode is written: no
+                    device is recreated and no data is moved.
   flush DEVICE ...  Force writeback of all dirty data of a backing device and
                     wait until the cache is clean again.
   attach DEVICE ... Attach backing devices to a cache set (--cache).
@@ -196,7 +202,9 @@ Arguments:
                     (bcache0), the kernel name (sdb1), a device path
                     (/dev/sdb1), a /dev/disk/by-id name or the backing device
                     UUID. For "status", "diff" and "apply" it acts as a
-                    filter and may be omitted to address every device.
+                    filter and may be omitted to address every device;
+                    "set-cache-mode" and the other runtime commands require
+                    it, and accept "all" for every backing device.
   TARGET            For "stop": a DEVICE as above, or a cache set UUID.
 
 General options:
@@ -251,6 +259,14 @@ Options for "doctor":
                     cache space.
                     Env: BCACHEMGMT_MIN_AVAILABLE  Default: 10
 
+Options for "make" and "set-cache-mode":
+      --cache-mode MODE
+                    The cache mode to use: writethrough, writeback,
+                    writearound or none. "make" applies it to the backing
+                    devices it creates, "set-cache-mode" to the devices named
+                    on the command line, where it is required.
+                    Env: BCACHEMGMT_CACHE_MODE     Default: (make-bcache)
+
 Options for "make":
   -B, --backing DEV Create a backing device on DEV. May be repeated.
                     Env: BCACHEMGMT_BACKING        Default: (none)
@@ -260,10 +276,6 @@ Options for "make":
                     difference to -c/--cache, which belongs to "attach".
                     Env: BCACHEMGMT_CACHE_DEVICES  Default: (none)
                     (comma separated when given as a variable)
-      --cache-mode MODE
-                    Cache mode for the new backing devices: writethrough,
-                    writeback, writearound or none.
-                    Env: BCACHEMGMT_CACHE_MODE     Default: (make-bcache)
       --bucket-size SIZE
                     Bucket size for the new cache devices, for example 512k.
                     Env: BCACHEMGMT_BUCKET_SIZE    Default: (make-bcache)
@@ -324,6 +336,8 @@ Examples:
   bcachemgmt doctor --min-available 20
   bcachemgmt diff
   bcachemgmt apply --dry-run
+  bcachemgmt set-cache-mode --cache-mode writethrough bcache0
+  bcachemgmt set-cache-mode --cache-mode writeback --dry-run all
   bcachemgmt flush bcache0 --timeout 600
   bcachemgmt attach --cache /dev/nvme0n1p1 bcache0
   bcachemgmt stop --yes bcache1
@@ -2692,6 +2706,120 @@ cmd_apply() {
 }
 
 # ==========================================================================
+# Command: set-cache-mode
+# ==========================================================================
+
+# How many devices this run actually changed. A global rather than a return
+# value, because the per-device helper aborts on a real failure and its exit
+# status therefore carries no information the caller could count.
+CACHE_MODE_CHANGED=0
+
+# Switch the cache mode of one already existing backing device.
+#
+# This is the non-destructive counterpart to "make --cache-mode": the only
+# thing it touches is .../bcache/cache_mode of a running device, so nothing
+# is recreated and no data is moved. bcache itself allows the switch at any
+# time; what changes is only where future writes land.
+set_cache_mode_one() {
+    local idx="${1}"
+    local mode="${2}"
+    local dir="${BDEV[${idx}|sysfs]}"
+    local label="${BDEV[${idx}|bcache_dev]:-${BDEV[${idx}|kernel_name]}}"
+    local current="${BDEV[${idx}|cache_mode]}"
+    local dirty="${BDEV[${idx}|dirty_data]}"
+    local readback
+
+    # A kernel that does not expose the attribute cannot be talked into the
+    # change; saying so beats writing nothing and reporting success.
+    if [ ! -e "${dir}/cache_mode" ]; then
+        die "${label}: this kernel does not expose ${dir}/cache_mode"
+    fi
+
+    # Already-correct is a normal outcome, not an error: it is what makes the
+    # command safe to run repeatedly, for example from a boot-time unit.
+    if [ "${current}" = "${mode}" ]; then
+        msg "${label}: cache mode is already ${mode}, nothing to do"
+        return 0
+    fi
+
+    # Both directions of a writeback switch change what a failing cache
+    # device would cost, so each one is spelled out before it is written.
+    # Neither is a reason to refuse: no data is lost either way, the operator
+    # only has to know which risk they just took on or handed back.
+    if [ "${current}" = "writeback" ]; then
+        if [ -n "${dirty}" ] && ! size_is_zero "${dirty}"; then
+            msg "${label}: ${dirty} of dirty data stays in the cache and is written back in the background; run '${SCRIPT_NAME} flush ${label}' to drain it now"
+        fi
+    elif [ "${mode}" = "writeback" ]; then
+        msg "${label}: writeback keeps not yet written data on the cache device only; losing that device from now on means losing that data"
+    fi
+
+    # A mode without a cache is not an error either: bcache stores it and
+    # starts honouring it as soon as a cache set is attached.
+    if [ -z "${BDEV[${idx}|cache_set]}" ]; then
+        msg "${label}: no cache attached, the mode takes effect once one is"
+    fi
+
+    sysfs_write "${dir}/cache_mode" "${mode}"
+    audit "set cache_mode of ${label} (${BDEV[${idx}|dev_path]}) from '${current:-unknown}' to '${mode}'"
+    CACHE_MODE_CHANGED=$((CACHE_MODE_CHANGED + 1))
+
+    # The kernel accepts a write of an unknown word and simply keeps the old
+    # value, so the result is read back. Same reasoning as in "apply": a
+    # silently ignored write must not be reported as a success.
+    if [ "${DRY_RUN}" != "1" ]; then
+        readback="$(read_attr_current "${dir}" cache_mode)"
+        if [ "${readback}" != "${mode}" ]; then
+            die "${label}: the kernel reports cache_mode as '${readback:-unknown}' after writing '${mode}'; the write was ignored"
+        fi
+    fi
+    return 0
+}
+
+# Entry point for the set-cache-mode command.
+cmd_set_cache_mode() {
+    local key idx
+
+    if [ -z "${CACHE_MODE_ARG}" ]; then
+        die_usage "set-cache-mode needs --cache-mode MODE (writethrough, writeback, writearound or none)"
+    fi
+    if [ "${#DEVICE_FILTER[@]}" -eq 0 ]; then
+        die_usage "set-cache-mode needs at least one device; give a bcache device, a backing device or 'all'"
+    fi
+    require_writable_sysfs
+
+    for key in "${DEVICE_FILTER[@]}"; do
+        if [ "${key}" = "all" ]; then
+            [ "${#BDEV_ORDER[@]}" -gt 0 ] || die "no bcache backing device is registered"
+            for idx in "${BDEV_ORDER[@]}"; do
+                set_cache_mode_one "${idx}" "${CACHE_MODE_ARG}"
+            done
+            continue
+        fi
+        idx="$(resolve_one_backing "${key}")"
+        set_cache_mode_one "${idx}" "${CACHE_MODE_ARG}"
+    done
+
+    msg ""
+    if [ "${DRY_RUN}" = "1" ]; then
+        msg "Dry run: ${CACHE_MODE_CHANGED} device(s) would be changed, nothing was written."
+        return 0
+    fi
+    if [ "${CACHE_MODE_CHANGED}" -eq 0 ]; then
+        msg "Nothing to do: every named device was already in cache mode ${CACHE_MODE_ARG}."
+        return 0
+    fi
+
+    msg "Changed the cache mode of ${CACHE_MODE_CHANGED} device(s)."
+
+    # cache_mode is a sysfs tunable and does not survive a reboot. Pointing
+    # at the declarative path once, right here, is what keeps a change made
+    # by hand from quietly disappearing at the next boot.
+    msg "Note: this is a runtime setting. Declare 'device NAME cache_mode=${CACHE_MODE_ARG}' in ${CONFIG_NAME} and run '${SCRIPT_NAME} apply' at boot to make it persistent."
+    return 0
+}
+
+# ==========================================================================
 # Runtime operations: shared machinery
 # ==========================================================================
 
@@ -3289,16 +3417,11 @@ cache_device_joined_set() {
 
 # Create backing and cache devices with make-bcache after verifying that
 # every target is really free.
-# TODO: Add a way to change the cache mode of an already existing backing
-# device without going through "make" (which recreates the device and, for
-# the backing device, can look like it risks data loss even though it
-# currently only touches cache_mode after creation). Today the only ways to
-# change cache_mode of a running device are --cache-mode here at creation
-# time, or a "device NAME cache_mode=..." directive applied via "apply".
-# Consider a dedicated command (e.g. "set-cache-mode DEVICE --cache-mode
-# MODE") or a --cache-mode option on an existing non-destructive command
-# such as "apply", writing straight to .../bcache/cache_mode via
-# sysfs_write(), the same way the block below already does for "make".
+#
+# --cache-mode is honoured here only for devices this command creates. To
+# change the mode of a device that already exists, use "set-cache-mode":
+# recreating a device just to change one tunable would look like it risks
+# data loss even though only cache_mode is written afterwards.
 cmd_make() {
     local -a args=()
     local dev mode name sysfs targets
@@ -3941,14 +4064,14 @@ main() {
     fi
 
     case "${COMMAND}" in
-        status|doctor|diff|apply|flush|attach|detach|stop|make|replace) ;;
+        status|doctor|diff|apply|set-cache-mode|flush|attach|detach|stop|make|replace) ;;
         *) die_usage "unknown command: ${COMMAND}" ;;
     esac
 
     # Everything that changes a device switches the syslog trail on and, in a
     # dry run, says so once instead of per line.
     case "${COMMAND}" in
-        apply|flush|attach|detach|stop|make|replace)
+        apply|set-cache-mode|flush|attach|detach|stop|make|replace)
             WRITE_COMMAND=1
             if [ "${DRY_RUN}" = "1" ]; then
                 msg "Dry run: nothing will be changed."
@@ -3987,6 +4110,7 @@ main() {
         doctor)  cmd_doctor ;;
         diff)    cmd_diff ;;
         apply)   cmd_apply ;;
+        set-cache-mode) cmd_set_cache_mode ;;
         flush)   cmd_flush ;;
         attach)  cmd_attach ;;
         detach)  cmd_detach ;;
