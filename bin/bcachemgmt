@@ -1423,6 +1423,13 @@ render_status_human() {
     fi
 }
 
+# TODO: "status" should also report SSD health for cache devices, via
+# "smartctl -H /dev/..." (smartmontools) or, for NVMe devices, "nvme
+# smart-log /dev/...". Guard each with a command -v / "if" check first
+# (similar to check_tools() above) so status still works when neither tool
+# is installed, and skip gracefully rather than failing. Likely belongs
+# either as an extra field per cache device here, or in "doctor" as its own
+# check.
 # Print one line per cache set with the numbers that matter day to day.
 render_cache_sets_human() {
     local idx caches backings avail
@@ -2141,6 +2148,13 @@ cache_device() {
     want_add cachedev "${key}" "$@"
 }
 
+# TODO: Remove /etc/org.conf and the whole ORGANIZATION concept entirely.
+# When this is done, also update:
+#   - the config file search order in load_config() below (sys_files/user_files
+#     both currently branch on ${ORGANIZATION}), and
+#   - the "Configuration file" section of usage() (around line 295), which
+#     documents /etc/${ORGANIZATION}/bcachemgmt.conf and
+#     ${HOME}/.config/${ORGANIZATION}/bcachemgmt.conf as the first lookup path.
 # Resolve ORGANIZATION from /etc/org.conf. The file is sourced in a subshell
 # with errexit disabled there, so a missing file or a faulty line cannot abort
 # this script; only ORGANIZATION is extracted and the script's own variables
@@ -3275,6 +3289,16 @@ cache_device_joined_set() {
 
 # Create backing and cache devices with make-bcache after verifying that
 # every target is really free.
+# TODO: Add a way to change the cache mode of an already existing backing
+# device without going through "make" (which recreates the device and, for
+# the backing device, can look like it risks data loss even though it
+# currently only touches cache_mode after creation). Today the only ways to
+# change cache_mode of a running device are --cache-mode here at creation
+# time, or a "device NAME cache_mode=..." directive applied via "apply".
+# Consider a dedicated command (e.g. "set-cache-mode DEVICE --cache-mode
+# MODE") or a --cache-mode option on an existing non-destructive command
+# such as "apply", writing straight to .../bcache/cache_mode via
+# sysfs_write(), the same way the block below already does for "make".
 cmd_make() {
     local -a args=()
     local dev mode name sysfs targets
