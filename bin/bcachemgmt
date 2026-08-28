@@ -261,10 +261,28 @@ Options for "doctor":
 
 Options for "make" and "set-cache-mode":
       --cache-mode MODE
-                    The cache mode to use: writethrough, writeback,
-                    writearound or none. "make" applies it to the backing
+                    The cache mode to use. "make" applies it to the backing
                     devices it creates, "set-cache-mode" to the devices named
-                    on the command line, where it is required.
+                    on the command line, where it is required. The modes are:
+                      writethrough  Reads are cached; writes go to cache and
+                                    backing device at once and are reported
+                                    as done only once the backing device has
+                                    them. The safe default: nothing lives on
+                                    the cache alone, so losing the cache
+                                    device costs speed but no data.
+                      writeback     Reads are cached; writes land on the
+                                    cache first and are written back to the
+                                    backing device later. Fastest for write
+                                    loads, but data that is not written back
+                                    yet exists on the cache device only.
+                      writearound   Reads are cached; writes bypass the cache
+                                    and go straight to the backing device.
+                                    Keeps a large write load from pushing the
+                                    read cache out, at the price of freshly
+                                    written data not being cached.
+                      none          Caching is off; reads and writes go to
+                                    the backing device. Dirty data that is
+                                    still in the cache is written back.
                     Env: BCACHEMGMT_CACHE_MODE     Default: (make-bcache)
 
 Options for "make":
