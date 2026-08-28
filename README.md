@@ -43,7 +43,7 @@ bcachemgmt status  [-l] [-j] [DEVICE ...]
 bcachemgmt doctor  [-j] [-m PERCENT]
 bcachemgmt diff    [-j] [DEVICE ...]
 bcachemgmt apply   [-n] [DEVICE ...]
-bcachemgmt set-cache-mode [-n] --cache-mode MODE DEVICE ...
+bcachemgmt set-cache-mode [-n] --cache-mode MODE (DEVICE ... | --cache-set UUID)
 bcachemgmt flush   [-n] [-t SECONDS] DEVICE ...
 bcachemgmt attach  [-n] [-c CACHE] DEVICE ...
 bcachemgmt detach  [-n] [-y] [-t SECONDS] DEVICE ...
@@ -203,7 +203,7 @@ Note: these are runtime settings. Run 'bcachemgmt apply' again after a reboot, o
 
 | Command          | What it does                                                               |
 |------------------|----------------------------------------------------------------------------|
-| `set-cache-mode` | Switches the cache mode of existing backing devices (`--cache-mode`)        |
+| `set-cache-mode` | Switches the cache mode of existing backing devices (`--cache-mode`), named individually or per cache set (`--cache-set`) |
 | `flush`          | Drains all dirty data to the backing disk and waits until the cache is clean|
 | `attach`         | Attaches backing devices to a cache set (`--cache`, autodetected if one)    |
 | `detach`         | Detaches backing devices; bcache writes the dirty data back first           |
@@ -211,7 +211,7 @@ Note: these are runtime settings. Run 'bcachemgmt apply' again after a reboot, o
 
 ### set-cache-mode
 
-Changes the cache mode of a backing device that already exists. Nothing is
+Changes the cache mode of backing devices that already exist. Nothing is
 recreated and no data is moved: the only thing written is
 `.../bcache/cache_mode`, exactly the attribute `apply` would write for a
 `device NAME cache_mode=...` directive. Use it when you want the change now
@@ -242,6 +242,28 @@ would have set cache_mode of bcache1 (/dev/sdc1) from 'writethrough' to 'writeba
 Dry run: 1 device(s) would be changed, nothing was written.
 ```
 
+`--cache-set` changes every backing device attached to one cache set in a
+single call, which is the usual unit of work: one SSD caches a group of
+disks, and the whole group is meant to run in the same mode. The set is named
+by its UUID or by one of its cache devices, and only the devices attached to
+it are touched, so a host with a second cache set or with uncached devices
+stays untouched where `all` would have reached everything:
+
+```
+$ bcachemgmt set-cache-mode --cache-mode writethrough --cache-set 5a3c1f2e-8b7d-4c11-9a2f-000000000001
+Cache set 5a3c1f2e-8b7d-4c11-9a2f-000000000001: 3 attached backing device(s)
+set cache_mode of bcache0 (/dev/sdb1) from 'writeback' to 'writethrough'
+set cache_mode of bcache1 (/dev/sdc1) from 'writeback' to 'writethrough'
+set cache_mode of bcache2 (/dev/sdd1) from 'writeback' to 'writethrough'
+
+Changed the cache mode of 3 device(s).
+```
+
+Naming the cache set by its SSD works just as well
+(`--cache-set /dev/nvme0n1p1`). Device arguments and `--cache-set` are
+mutually exclusive: the two would answer the same question differently, so
+giving both is a usage error instead of a silent decision.
+
 A device that is already in the wanted mode is reported and skipped, so the
 command is safe to run repeatedly. Switching away from `writeback` leaves the
 dirty data in the cache to be written back in the background; the command
@@ -270,6 +292,7 @@ which is the right choice for a large writeback cache.
 
 ```
 bcachemgmt set-cache-mode --cache-mode writearound bcache0
+bcachemgmt set-cache-mode --cache-mode writethrough --cache-set 5a3c1f2e-...
 bcachemgmt flush bcache0 --timeout 0
 bcachemgmt attach --cache /dev/nvme0n1p1 bcache1
 bcachemgmt detach --yes bcache0

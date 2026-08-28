@@ -25,7 +25,7 @@
 # Usage:
 #   run-tests.sh [-v|--verbose] [-k|--keep]
 #
-# Version: 1.1.0  (2026-08-28)
+# Version: 1.2.0  (2026-08-28)
 
 set -uo pipefail
 
@@ -412,6 +412,61 @@ test_set_cache_mode() {
     assert_equal "set-cache-mode --dry-run wrote nothing" "${before}" "${after}"
 }
 
+# Addressing a whole cache set in one call. The fixture has bcache0 attached
+# to the cache set and bcache1 attached to nothing, so a --cache-set run that
+# reaches only bcache0 proves the selection really follows the set instead of
+# behaving like "all".
+test_set_cache_mode_cache_set() {
+    local uuid="5a3c1f2e-8b7d-4c11-9a2f-000000000001"
+    local before after
+
+    assert_status "set-cache-mode --cache-set exits 0" 0 \
+        "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run \
+        --cache-mode writethrough --cache-set "${uuid}"
+    assert_output_contains "the cache set is named" "Cache set ${uuid}"
+    assert_output_contains "the number of members is named" "1 attached backing device(s)"
+    assert_output_contains "the member is changed" \
+        "would have set cache_mode of bcache0 (/dev/sdb1) from 'writeback' to 'writethrough'"
+    assert_output_lacks "the unattached device is left alone" "cache_mode of bcache1"
+
+    # A cache device stands in for its set, so the SSD path an operator has
+    # in front of them is enough to address everything it caches.
+    assert_status "a cache device names the set" 0 \
+        "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run \
+        --cache-mode writearound --cache-set /dev/nvme0n1p1
+    assert_output_contains "the resolved set is named" "Cache set ${uuid}"
+
+    # Like every other option it is settable from the environment.
+    assert_status "the cache set can come from the environment" 0 \
+        env "BCACHEMGMT_CACHE_SET=${uuid}" "${BCACHEMGMT}" set-cache-mode \
+        "${COMMON[@]}" --dry-run --cache-mode none
+    assert_output_contains "the environment value is used" "Cache set ${uuid}"
+
+    assert_status "an unknown cache set exits 1" 1 \
+        "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run \
+        --cache-mode none --cache-set nosuchset
+    assert_output_contains "the unknown cache set is named" "no cache set matches 'nosuchset'"
+
+    # Mixing the two ways of naming targets is a usage error, not a silent
+    # decision in favour of one of them.
+    assert_status "--cache-set with a device exits 2" 2 \
+        "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run \
+        --cache-mode none --cache-set "${uuid}" bcache0
+    assert_output_contains "the conflict is explained" \
+        "either --cache-set or device arguments, not both"
+
+    # The missing-device message has to offer the cache set as a way out.
+    assert_status "set-cache-mode without a target exits 2" 2 \
+        "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run --cache-mode none
+    assert_output_contains "the cache set is offered" "--cache-set UUID"
+
+    before="$(tree_state)"
+    "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run --verbose \
+        --cache-mode none --cache-set "${uuid}" >/dev/null 2>&1
+    after="$(tree_state)"
+    assert_equal "the cache set dry run wrote nothing" "${before}" "${after}"
+}
+
 # The layered precedence must hold: command line over environment over
 # configuration file over built-in default.
 test_precedence() {
@@ -722,6 +777,7 @@ main() {
     test_config_validation
     test_write_refusals
     test_set_cache_mode
+    test_set_cache_mode_cache_set
     test_precedence
 
     # The white box tests replace this shell's globals, so they run last.
