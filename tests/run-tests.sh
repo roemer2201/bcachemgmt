@@ -25,7 +25,7 @@
 # Usage:
 #   run-tests.sh [-v|--verbose] [-k|--keep]
 #
-# Version: 1.0.0  (2026-08-27)
+# Version: 1.1.0  (2026-08-28)
 
 set -uo pipefail
 
@@ -195,6 +195,7 @@ test_reporting() {
 
     assert_status "help exits 0" 0 "${BCACHEMGMT}" help
     assert_output_contains "help lists the apply command" "apply"
+    assert_output_contains "help lists the set-cache-mode command" "set-cache-mode"
     assert_output_contains "help lists the replace command" "replace"
 
     assert_status "unknown command exits 2" 2 "${BCACHEMGMT}" nonsense
@@ -344,6 +345,73 @@ test_write_refusals() {
     assert_output_contains "the unknown device is named" "no bcache backing device matches 'nosuchdevice'"
 }
 
+# The non-destructive cache mode change. It must refuse a captured tree like
+# every other changing command, and its dry run must describe the switch
+# precisely enough to be reviewed before the same call is made for real.
+test_set_cache_mode() {
+    local before after
+
+    assert_status "set-cache-mode refuses a captured sysfs tree" 1 \
+        "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --cache-mode writethrough bcache0
+    assert_output_contains "set-cache-mode explains the refusal" "refusing to modify devices"
+
+    assert_status "set-cache-mode without --cache-mode exits 2" 2 \
+        "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run bcache0
+    assert_output_contains "the missing mode is named" "needs --cache-mode MODE"
+
+    assert_status "set-cache-mode without a device exits 2" 2 \
+        "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run --cache-mode none
+    assert_output_contains "the missing device is named" "needs at least one device"
+
+    assert_status "an invalid mode exits 2" 2 \
+        "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run --cache-mode turbo bcache0
+    assert_output_contains "the allowed modes are listed" \
+        "expected writethrough, writeback, writearound or none"
+
+    # The dry run has to name the device, the old value and the new one:
+    # that triple is what makes it reviewable.
+    assert_status "set-cache-mode --dry-run exits 0" 0 \
+        "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run --cache-mode writethrough bcache0
+    assert_output_contains "the dry run announces itself" "Dry run: nothing will be changed"
+    assert_output_contains "the dry run describes the switch" \
+        "would have set cache_mode of bcache0 (/dev/sdb1) from 'writeback' to 'writethrough'"
+    assert_output_contains "the dry run counts the devices" "1 device(s) would be changed"
+
+    # Leaving writeback must point at the dirty data that stays behind.
+    assert_output_contains "the dirty data is called out" "of dirty data stays in the cache"
+
+    # Entering writeback must state what a failing cache device now costs.
+    assert_status "switching to writeback exits 0" 0 \
+        "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run --cache-mode writeback bcache1
+    assert_output_contains "the writeback risk is stated" "losing that device"
+    assert_output_contains "the missing cache is stated" "no cache attached"
+
+    # A device that already has the mode is a no-op, not an error.
+    assert_status "an unchanged mode exits 0" 0 \
+        "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run --cache-mode writeback bcache0
+    assert_output_contains "the no-op is named" "cache mode is already writeback"
+    assert_output_contains "the no-op counts as no change" "0 device(s) would be changed"
+
+    # "all" addresses every backing device in one call.
+    assert_status "set-cache-mode all exits 0" 0 \
+        "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run --cache-mode writearound all
+    assert_output_contains "all reaches bcache0" "cache_mode of bcache0"
+    assert_output_contains "all reaches bcache1" "cache_mode of bcache1"
+    assert_output_contains "all counts both devices" "2 device(s) would be changed"
+
+    # The mode is settable by environment variable like every other option.
+    assert_status "the mode can come from the environment" 0 \
+        env BCACHEMGMT_CACHE_MODE=none "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run bcache0
+    assert_output_contains "the environment value is used" "to 'none'"
+
+    # And none of it may have touched a single byte of the fixture.
+    before="$(tree_state)"
+    "${BCACHEMGMT}" set-cache-mode "${COMMON[@]}" --dry-run --verbose --cache-mode none all \
+        >/dev/null 2>&1
+    after="$(tree_state)"
+    assert_equal "set-cache-mode --dry-run wrote nothing" "${before}" "${after}"
+}
+
 # The layered precedence must hold: command line over environment over
 # configuration file over built-in default.
 test_precedence() {
@@ -470,6 +538,42 @@ test_write_path() {
     drift_after="$(plan_count drift)"
     assert_equal "no drift is left after applying" "0" "${drift_after}"
     assert_equal "everything is now in sync" "8" "$(plan_count match)"
+}
+
+# The write half of "set-cache-mode", exercised one level below the guard
+# that refuses a captured tree. It must write cache_mode and nothing else,
+# and it must recognize a device that is already in the wanted mode.
+test_set_cache_mode_write() {
+    local before after
+
+    # The plan test above changed the tree, so the state is collected again.
+    BDEV=(); BDEV_ORDER=(); CDEV=(); CDEV_ORDER=(); CSET=(); CSET_ORDER=()
+    FLASH_VOLUMES=(); REGISTERED=()
+    collect_state
+
+    CACHE_MODE_CHANGED=0
+    before="$(tree_state)"
+    set_cache_mode_one 0 "${BDEV[0|cache_mode]}" >/dev/null
+    after="$(tree_state)"
+    assert_equal "an unchanged mode is not counted" "0" "${CACHE_MODE_CHANGED}"
+    assert_equal "an unchanged mode writes nothing"  "${before}" "${after}"
+
+    set_cache_mode_one 0 writearound >/dev/null
+    assert_equal "the new mode was written" "writearound" \
+        "$(cat "${WORKDIR}/sysfs/block/sdb/sdb1/bcache/cache_mode")"
+    assert_equal "the change was counted" "1" "${CACHE_MODE_CHANGED}"
+
+    # Only cache_mode may move. writeback_percent is the neighbour a write
+    # aimed at the wrong path would most plausibly hit; the plan test left
+    # it at 20, so an unchanged 20 proves the write stayed where it belongs.
+    assert_equal "the neighbouring attribute is untouched" "20" \
+        "$(cat "${WORKDIR}/sysfs/block/sdb/sdb1/bcache/writeback_percent")"
+
+    # Reading it back through the collector must yield the selected word.
+    BDEV=(); BDEV_ORDER=(); CDEV=(); CDEV_ORDER=(); CSET=(); CSET_ORDER=()
+    FLASH_VOLUMES=(); REGISTERED=()
+    collect_state
+    assert_equal "the written mode is read back" "writearound" "${BDEV[0|cache_mode]}"
 }
 
 # The guards are what stand between "stop the device I am done with" and data
@@ -617,6 +721,7 @@ main() {
     test_diff
     test_config_validation
     test_write_refusals
+    test_set_cache_mode
     test_precedence
 
     # The white box tests replace this shell's globals, so they run last.
@@ -624,6 +729,7 @@ main() {
     test_size_normalization
     test_collection
     test_write_path
+    test_set_cache_mode_write
     test_guards
     test_device_guards
 

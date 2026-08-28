@@ -43,6 +43,7 @@ bcachemgmt status  [-l] [-j] [DEVICE ...]
 bcachemgmt doctor  [-j] [-m PERCENT]
 bcachemgmt diff    [-j] [DEVICE ...]
 bcachemgmt apply   [-n] [DEVICE ...]
+bcachemgmt set-cache-mode [-n] --cache-mode MODE DEVICE ...
 bcachemgmt flush   [-n] [-t SECONDS] DEVICE ...
 bcachemgmt attach  [-n] [-c CACHE] DEVICE ...
 bcachemgmt detach  [-n] [-y] [-t SECONDS] DEVICE ...
@@ -200,12 +201,59 @@ Note: these are runtime settings. Run 'bcachemgmt apply' again after a reboot, o
 
 ## Runtime operations
 
-| Command  | What it does                                                                       |
-|----------|------------------------------------------------------------------------------------|
-| `flush`  | Drains all dirty data to the backing disk and waits until the cache is clean        |
-| `attach` | Attaches backing devices to a cache set (`--cache`, autodetected if there is one)   |
-| `detach` | Detaches backing devices; bcache writes the dirty data back first and this waits    |
-| `stop`   | Stops a backing device or a whole cache set                                         |
+| Command          | What it does                                                               |
+|------------------|----------------------------------------------------------------------------|
+| `set-cache-mode` | Switches the cache mode of existing backing devices (`--cache-mode`)        |
+| `flush`          | Drains all dirty data to the backing disk and waits until the cache is clean|
+| `attach`         | Attaches backing devices to a cache set (`--cache`, autodetected if one)    |
+| `detach`         | Detaches backing devices; bcache writes the dirty data back first           |
+| `stop`           | Stops a backing device or a whole cache set                                 |
+
+### set-cache-mode
+
+Changes the cache mode of a backing device that already exists. Nothing is
+recreated and no data is moved: the only thing written is
+`.../bcache/cache_mode`, exactly the attribute `apply` would write for a
+`device NAME cache_mode=...` directive. Use it when you want the change now
+without declaring it, or when the device is not covered by the configuration
+file at all.
+
+```
+$ bcachemgmt set-cache-mode --cache-mode writethrough bcache0
+bcache0: 1.2G of dirty data stays in the cache and is written back in the background; run 'bcachemgmt flush bcache0' to drain it now
+set cache_mode of bcache0 (/dev/sdb1) from 'writeback' to 'writethrough'
+
+Changed the cache mode of 1 device(s).
+Note: this is a runtime setting. Declare 'device NAME cache_mode=writethrough' in bcachemgmt.conf and run 'bcachemgmt apply' at boot to make it persistent.
+```
+
+`--dry-run` prints the same lines prefixed with `would have`, and writes
+nothing:
+
+```
+$ bcachemgmt set-cache-mode --cache-mode writeback --dry-run all
+Dry run: nothing will be changed.
+
+bcache0: cache mode is already writeback, nothing to do
+bcache1: writeback keeps not yet written data on the cache device only; losing that device from now on means losing that data
+bcache1: no cache attached, the mode takes effect once one is
+would have set cache_mode of bcache1 (/dev/sdc1) from 'writethrough' to 'writeback'
+
+Dry run: 1 device(s) would be changed, nothing was written.
+```
+
+A device that is already in the wanted mode is reported and skipped, so the
+command is safe to run repeatedly. Switching away from `writeback` leaves the
+dirty data in the cache to be written back in the background; the command
+says so and points at `flush` if you want it drained now. Switching to
+`writeback` says what a failing cache device would then cost. Neither is
+refused: no data is lost either way.
+
+The write goes straight to `.../bcache/cache_mode` and the value is read back
+afterwards, so a mode the kernel silently ignored is reported as an error
+rather than as a success.
+
+### flush, attach, detach and stop
 
 `flush` works the way bcache itself does: it sets `writeback_percent` to 0 so
 the writeback thread drains everything, waits for `dirty_data` to reach zero,
@@ -221,6 +269,7 @@ overrides each of those and says so.
 which is the right choice for a large writeback cache.
 
 ```
+bcachemgmt set-cache-mode --cache-mode writearound bcache0
 bcachemgmt flush bcache0 --timeout 0
 bcachemgmt attach --cache /dev/nvme0n1p1 bcache1
 bcachemgmt detach --yes bcache0
