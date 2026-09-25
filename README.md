@@ -25,6 +25,7 @@ described in [NEW-FEATURES.md](NEW-FEATURES.md).
 * `lsblk` - optional for `status` (detects unregistered superblocks and shows
   what sits on top of a bcache device)
 * `blkid` and `make-bcache` (bcache-tools) - required for `attach -B` only
+* `wipefs` (util-linux) - additionally required for `attach -B --force`
 
 Reading needs no privileges; a few sysfs attributes may be unreadable for an
 unprivileged user and are then reported as unknown. Every changing command
@@ -134,16 +135,20 @@ A fresh disk given with `-B` goes through these steps:
    be a block device, not be mounted, carry no partitions or holders, not be
    registered with bcache and carry no signature (probed directly with
    `blkid --probe`, so a missing udev database cannot hide a filesystem).
-   `--force` overrides partitions, holders and a foreign signature; a
-   mounted disk is always refused. `--wipe` allows overwriting an old bcache
-   superblock.
+   `--force` allows partitions, holders and foreign signatures; after
+   confirmation, `wipefs --all --force` clears their signatures before
+   formatting. A mount anywhere above the disk, including one on a
+   partition or device-mapper holder, is always refused. `--wipe` allows
+   overwriting an old bcache superblock.
 2. One confirmation for all disks (`--yes` in scripts).
-3. `make-bcache -B` formats them. The block size of the cache set is passed
-   on, because the kernel refuses to attach a backing device with a smaller
-   block size than the set.
+3. `make-bcache -B` formats them. The block size passed on is the larger of
+   the cache set block size and the logical block sizes of all fresh disks.
+   A smaller value would prevent a 4Kn disk from registering or prevent a
+   backing device from attaching to the cache set.
 4. The disks are registered with the kernel explicitly, so the result does
    not depend on udev.
-5. Every device is attached, and `--cache-mode` is applied if given.
+5. Every device is attached and the resulting cache-set link is checked.
+   `--cache-mode` is applied if given. A missing or wrong link is an error.
 
 A disk that already carries a bcache superblock is most likely a stopped
 backing device that still holds its data. The command refuses it and says so
@@ -164,9 +169,9 @@ bcachemgmt detach --stop --timeout 0 bcache1
 
 `--stop` additionally stops the device after the detach: `/dev/bcacheN`
 disappears and the disk is released. The data and the superblock stay on the
-disk. Before anything is written, a mounted bcache device or one with
-holders (LVM, LUKS, ...) is refused unless `--force` is given, so a refusal
-never leaves a device detached but not stopped.
+disk. Before anything is written, mounts and holders on the bcache device,
+its partitions and higher layers (LVM, LUKS, ...) are checked. Without
+`--force`, a used device is refused before the detach begins.
 
 ## Safety model
 

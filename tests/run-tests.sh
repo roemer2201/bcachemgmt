@@ -25,7 +25,7 @@
 # Usage:
 #   run-tests.sh [-v|--verbose] [-k|--keep]
 #
-# Version: 2.0.0  (2026-09-24)
+# Version: 2.0.1  (2026-09-25)
 
 set -uo pipefail
 
@@ -594,6 +594,100 @@ test_attach_detach_write() {
     recollect
 }
 
+# An attach must be verified before the command reports success or logs a
+# change. The captured tree does not create the kernel link after a write, so
+# replace only the wait to reproduce a link that never appears.
+test_attach_verification() {
+    local uuid="5a3c1f2e-8b7d-4c11-9a2f-000000000001"
+    local sdc="${WORKDIR}/sysfs/block/sdc/sdc1/bcache"
+    local wrong="${WORKDIR}/sysfs/fs/bcache/00000000-0000-0000-0000-000000000002"
+    local out rc
+
+    recollect
+    out="$(
+        wait_for_condition() { return 1; }
+        audit() { printf 'AUDITED: %s\n' "$*"; }
+        attach_one 1 "${uuid}" 2>&1
+    )"
+    rc="$?"
+    assert_equal "an unverified attach exits non-zero" "1" "${rc}"
+    if [[ "${out}" == *"AUDITED:"* ]]; then
+        report 0 "an unverified attach is not audited" "got: ${out}"
+    else
+        report 1 "an unverified attach is not audited" ""
+    fi
+
+    # An existing link to a different cache set is not proof of success.
+    mkdir -p "${wrong}"
+    ln -s "${wrong}" "${sdc}/cache"
+    if backing_attached_to_set "${sdc}" "${uuid}"; then
+        report 0 "a link to the wrong cache set is refused" "wrong link accepted"
+    else
+        report 1 "a link to the wrong cache set is refused" ""
+    fi
+    rm -f -- "${sdc}/cache"
+    rmdir -- "${wrong}"
+    : >"${sdc}/attach"
+    recollect
+}
+
+# A cache set with 512-byte blocks can accept a fresh 4Kn backing device only
+# if make-bcache is given the larger logical block size. --force must clear
+# foreign signatures before it asks make-bcache to format the disk.
+test_fresh_format_plan() {
+    local uuid="5a3c1f2e-8b7d-4c11-9a2f-000000000001"
+    local disk="${WORKDIR}/sysfs/block/sdz"
+    local out
+
+    mkdir -p "${disk}/queue" "${disk}/sdz1"
+    printf '4096' >"${disk}/queue/logical_block_size"
+    : >"${disk}/sdz1/partition"
+    assert_equal "partition inherits 4Kn logical block size" "4096" \
+        "$(logical_block_bytes /dev/sdz1)"
+
+    NEW_BACKING=(/dev/sdz1)
+    DRY_RUN=1
+    out="$(format_backing_devices "${uuid}")"
+    if [[ "${out}" == *"make-bcache --block 4096 -B /dev/sdz1"* ]]; then
+        report 1 "fresh 4Kn disk gets a 4096-byte superblock" ""
+    else
+        report 0 "fresh 4Kn disk gets a 4096-byte superblock" "got: ${out}"
+    fi
+
+    FORCE=1
+    out="$(format_backing_devices "${uuid}")"
+    if [[ "${out}" == *"wipefs --all --force -- /dev/sdz1"*"make-bcache --block 4096 -B /dev/sdz1"* ]]; then
+        report 1 "force wipes signatures before formatting" ""
+    else
+        report 0 "force wipes signatures before formatting" "got: ${out}"
+    fi
+
+    FORCE=0
+    DRY_RUN=0
+    NEW_BACKING=()
+    rm -rf -- "${disk}"
+}
+
+# A disk carrying bcache alongside another signature must still require the
+# explicit --wipe flag before the --force path can clear all signatures.
+test_force_wipe_guard() {
+    local out rc
+
+    out="$(
+        FORCE=1
+        DO_WIPE=0
+        wipefs() { printf 'ext4\nbcache\n'; }
+        guard_force_wipe_signatures /dev/example 2>&1
+    )"
+    rc="$?"
+    assert_equal "force alone cannot erase a bcache superblock" "1" "${rc}"
+    if [[ "${out}" == *"pass --wipe explicitly"* ]]; then
+        report 1 "the bcache guard explains --wipe" ""
+    else
+        report 0 "the bcache guard explains --wipe" "got: ${out}"
+    fi
+}
+
 # The guards are what stand between "stop the device I am done with" and data
 # loss, so each one is checked for the refusal and for the --force override.
 test_guards() {
@@ -646,6 +740,70 @@ test_guards() {
         report 0 "--yes confirms non-interactively" "still refused"
     fi
     ASSUME_YES=0
+}
+
+# A mount on a partition and a holder of that partition both make the base
+# bcache device unsafe to stop. Mock only the mount table lookup; the device
+# topology itself is traversed through the captured sysfs tree.
+test_stacked_device_guards() {
+    local partition="${WORKDIR}/sysfs/block/bcache0/bcache0p1"
+    local holder="${WORKDIR}/sysfs/block/dm-7"
+    local saved_mount_fn out rc
+
+    mkdir -p "${partition}/holders/dm-7" "${holder}"
+    : >"${partition}/partition"
+    saved_mount_fn="$(declare -f mount_points_of_names)"
+    mount_points_of_names() {
+        local name
+        for name in "$@"; do
+            if [ "${name}" = "bcache0p1" ]; then
+                printf '/srv/data'
+                return 0
+            fi
+        done
+        printf ''
+    }
+
+    out="$( (guard_device_in_use 0 stop) 2>&1 )"
+    rc="$?"
+    assert_equal "a mounted bcache partition blocks stop" "1" "${rc}"
+    if [[ "${out}" == *"mounted on /srv/data"* ]]; then
+        report 1 "the partition mount is named" ""
+    else
+        report 0 "the partition mount is named" "got: ${out}"
+    fi
+
+    # The mount may instead be on a device-mapper layer above the partition.
+    mount_points_of_names() {
+        local name
+        for name in "$@"; do
+            if [ "${name}" = "dm-7" ]; then
+                printf '/srv/crypt'
+                return 0
+            fi
+        done
+        printf ''
+    }
+    out="$( (guard_device_in_use 0 stop) 2>&1 )"
+    rc="$?"
+    assert_equal "a mounted partition holder blocks stop" "1" "${rc}"
+    if [[ "${out}" == *"mounted on /srv/crypt"* ]]; then
+        report 1 "the holder mount is named" ""
+    else
+        report 0 "the holder mount is named" "got: ${out}"
+    fi
+
+    eval "${saved_mount_fn}"
+    out="$( (guard_device_in_use 0 stop) 2>&1 )"
+    rc="$?"
+    assert_equal "a partition holder blocks stop" "1" "${rc}"
+    if [[ "${out}" == *"in use by dm-7"* ]]; then
+        report 1 "the partition holder is named" ""
+    else
+        report 0 "the partition holder is named" "got: ${out}"
+    fi
+
+    rm -rf -- "${partition}" "${holder}"
 }
 
 # The guards of "attach -B" decide whether a device gets formatted, so they
@@ -751,7 +909,11 @@ main() {
     test_collection
     test_set_cache_mode_write
     test_attach_detach_write
+    test_attach_verification
+    test_fresh_format_plan
+    test_force_wipe_guard
     test_guards
+    test_stacked_device_guards
     test_device_guards
 
     printf '\n%d test(s) run, %d failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"

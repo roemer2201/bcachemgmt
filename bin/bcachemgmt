@@ -42,9 +42,10 @@
 # Requirements:
 #   bash 4.2 or newer, a kernel with bcache support. "lsblk" is optional for
 #   reporting. "blkid" (or "lsblk" as fallback) and "make-bcache" from
-#   bcache-tools are required for "attach -B" only.
+#   bcache-tools are required for "attach -B" only. "wipefs" is also needed
+#   when "attach -B" is used with --force.
 #
-# Version: 2.0.0  (2026-09-24)
+# Version: 2.0.1  (2026-09-25)
 
 # Robustness baseline. Sysfs reads that are allowed to fail are handled
 # explicitly inside sysfs_read().
@@ -61,7 +62,7 @@ set -euo pipefail
 shopt -s nullglob
 
 SCRIPT_NAME="$(basename -- "${0}")"
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 
 # --- Settings -------------------------------------------------------------
 # Every setting is seeded from its environment variable, falling back to the
@@ -173,7 +174,9 @@ Options for the changing commands:
   -f, --force       Override the safety guards: for "attach -B" a partition
                     table, a holder or a foreign signature on the fresh
                     disk, for "detach --stop" a mounted or otherwise used
-                    bcache device. A mounted fresh disk is never accepted.
+                    bcache device. With "attach -B", wipefs clears existing
+                    signatures before formatting. A mounted fresh disk or
+                    any mounted device above it is never accepted.
                     Env: BCACHEMGMT_FORCE          Default: 0
   -c, --cache-set SET
                     The cache set to work on. "set-cache-mode" changes every
@@ -1138,17 +1141,42 @@ mount_points_of_names() {
     printf '%s' "${result}"
 }
 
-# Report where a bcache device is mounted. Reads /proc/self/mounts, so it
-# only works on the live system; a captured tree yields nothing and the
-# caller falls back to the collected usage information.
-mounted_targets_of() {
-    local bcache_dev="${1}"
+# Walk the complete block-device stack above a device. A filesystem can be
+# mounted on a partition or on a holder of that partition without the base
+# device itself appearing as a mount source. The queue also includes holders
+# of holders, so an LVM or dm-crypt layer cannot hide the mount.
+device_stack_names() {
+    local root="${1}"
+    local name sysfs holder next=0
+    local -a pending=("${root}") partitions=()
+    local -A seen=()
 
-    if [ -z "${bcache_dev}" ]; then
-        printf ''
-        return 0
-    fi
-    mount_points_of_names "${bcache_dev}"
+    [ -n "${root}" ] || return 0
+    while [ "${next}" -lt "${#pending[@]}" ]; do
+        name="${pending[next]}"
+        next=$((next + 1))
+        [ -z "${seen[${name}]:-}" ] || continue
+        seen["${name}"]=1
+        printf '%s\n' "${name}"
+
+        sysfs="$(sysfs_dir_for_device "${name}")"
+        [ -n "${sysfs}" ] || continue
+        mapfile -t partitions < <(partitions_of "${sysfs}")
+        if [ "${#partitions[@]}" -gt 0 ]; then
+            pending+=("${partitions[@]}")
+        fi
+        for holder in "${sysfs}/holders"/*; do
+            [ -e "${holder}" ] || continue
+            pending+=("${holder##*/}")
+        done
+    done
+}
+
+# Find mounts anywhere in the stack rooted at a block device.
+mount_points_of_stack() {
+    local -a names=()
+    mapfile -t names < <(device_stack_names "${1}")
+    mount_points_of_names "${names[@]}"
 }
 
 # Report the holders of a block device (LVM, LUKS, MD, ...) as a comma
@@ -1174,6 +1202,21 @@ holders_of() {
     printf '%s' "${result}"
 }
 
+# Include holders of partitions and of higher layers in the in-use check.
+holders_of_stack() {
+    local name found result=""
+    local -a names=()
+
+    mapfile -t names < <(device_stack_names "${1}")
+    for name in "${names[@]}"; do
+        found="$(holders_of "${name}")"
+        if [ -n "${found}" ]; then
+            result="${result}${result:+, }${found}"
+        fi
+    done
+    printf '%s' "${result}"
+}
+
 # Refuse to act on a backing device that is still in use, unless --force was
 # given. This is the guard that separates "stop the device I am done with"
 # from "pull the disk out from under a mounted filesystem".
@@ -1183,8 +1226,8 @@ guard_device_in_use() {
     local bcache_dev mounts holders
 
     bcache_dev="${BDEV[${idx}|bcache_dev]}"
-    mounts="$(mounted_targets_of "${bcache_dev}")"
-    holders="$(holders_of "${bcache_dev}")"
+    mounts="$(mount_points_of_stack "${bcache_dev}")"
+    holders="$(holders_of_stack "${bcache_dev}")"
 
     if [ -n "${mounts}" ]; then
         if [ "${FORCE}" != "1" ]; then
@@ -1699,14 +1742,18 @@ backing_is_detached() {
     return 0
 }
 
-# True when a backing device is attached to a cache set, the inverse of the
-# check above. Used to confirm that an attach really took effect.
-backing_is_attached() {
+# The mere presence of a link does not prove attachment to the requested
+# cache set: check its target after the kernel has processed the write.
+backing_attached_to_set() {
     local dir="${1}"
-    if [ -L "${dir}/cache" ] || [ -L "${dir}/set" ]; then
-        return 0
+    local uuid="${2}"
+    local attached
+
+    attached="$(sysfs_link_name "${dir}/cache")"
+    if [ -z "${attached}" ]; then
+        attached="$(sysfs_link_name "${dir}/set")"
     fi
-    return 1
+    [ "${attached}" = "${uuid}" ]
 }
 
 # True once the kernel has removed a block device.
@@ -1792,6 +1839,24 @@ device_signature() {
     return 1
 }
 
+# Keep --force from erasing an old bcache superblock unless --wipe was also
+# requested. A device can carry more than one signature, so inspect all of
+# them rather than trusting the first type reported by blkid.
+guard_force_wipe_signatures() {
+    local dev="${1}"
+    local signatures
+
+    [ "${FORCE}" = "1" ] && [ "${DO_WIPE}" != "1" ] || return 0
+    command -v wipefs >/dev/null 2>&1 || return 0
+    if ! signatures="$(wipefs --no-act --noheadings --output TYPE -- "${dev}")"; then
+        die "cannot inspect all signatures on ${dev} with wipefs; refusing to format it"
+    fi
+    if [[ "${signatures}" =~ (^|[[:space:]])bcache($|[[:space:]]) ]]; then
+        die "${dev} carries a bcache superblock; pass --wipe explicitly before erasing it"
+    fi
+    return 0
+}
+
 # Refuse to format a device that is not demonstrably unused.
 #
 # make-bcache overwrites the start of the device without asking, so every
@@ -1828,12 +1893,11 @@ guard_fresh_device() {
     if [ "${#names[@]}" -gt 0 ]; then
         parts="${names[*]}"
     fi
-    holders="$(holders_of "${name}")"
+    holders="$(holders_of_stack "${name}")"
 
     # A mount anywhere in that stack is the most conclusive evidence of use,
-    # so the device and all of its partitions are checked together.
-    names+=("${name}")
-    mounts="$(mount_points_of_names "${names[@]}")"
+    # including mounts on a holder of one of its partitions.
+    mounts="$(mount_points_of_stack "${name}")"
 
     if [ -n "${mounts}" ]; then
         die "refusing to use ${dev} as a ${purpose}: it or a partition of it is mounted on ${mounts}"
@@ -1869,6 +1933,7 @@ guard_fresh_device() {
             warn "${dev} carries a ${signature} signature and is being overwritten because --force was given"
         fi
     fi
+    guard_force_wipe_signatures "${dev}"
     return 0
 }
 
@@ -1921,8 +1986,8 @@ declare -ga ATTACH_TARGETS=()
 # block size". make-bcache picks the logical block size of the device by
 # default, which is 512 bytes on most disks, so a cache set created with a
 # larger block size would reject every freshly formatted disk unless the size
-# of the set is passed on explicitly. make-bcache uses the larger of the
-# given size and the device's own, so passing it never makes things worse.
+# of the set is passed on explicitly. An explicit --block replaces the tool's
+# automatic choice, so the logical block size of each new disk is checked too.
 cache_set_block_bytes() {
     local uuid="${1}"
     local idx
@@ -1936,6 +2001,28 @@ cache_set_block_bytes() {
     done
 }
 
+# Read the logical block size of a new disk from sysfs. Partitions inherit
+# their queue from the parent disk. This must be known before make-bcache
+# writes a superblock, because an explicit --block disables its own device
+# size autodetection.
+logical_block_bytes() {
+    local dev="${1}"
+    local name sysfs path size
+
+    name="$(kernel_name_of_path "${dev}")"
+    sysfs="$(sysfs_dir_for_device "${name}")"
+    [ -n "${sysfs}" ] || die "no sysfs entry for ${dev}; cannot determine its logical block size"
+    path="${sysfs}/queue/logical_block_size"
+    if [ ! -r "${path}" ]; then
+        path="${sysfs%/*}/queue/logical_block_size"
+    fi
+    size="$(sysfs_read "${path}")"
+    if ! [[ "${size}" =~ ^[0-9]+$ ]] || [ "${size}" -eq 0 ]; then
+        die "cannot read the logical block size of ${dev} from ${path}"
+    fi
+    printf '%s' "${size}"
+}
+
 # True once a registered device exposes the attributes of a backing device.
 backing_registered() {
     [ -e "${1}/bcache/cache_mode" ]
@@ -1946,18 +2033,32 @@ backing_registered() {
 # called.
 format_backing_devices() {
     local uuid="${1}"
-    local block
+    local block logical dev
     local -a args=()
 
     block="$(cache_set_block_bytes "${uuid}")"
-    if [ -n "${block}" ]; then
-        args+=(--block "${block}")
-    fi
+    [ -n "${block}" ] || die "cannot read the block size of cache set ${uuid}; refusing to format a backing device"
+    for dev in "${NEW_BACKING[@]}"; do
+        logical="$(logical_block_bytes "${dev}")"
+        if [ "${logical}" -gt "${block}" ]; then
+            block="${logical}"
+        fi
+    done
+    args+=(--block "${block}")
     if [ "${DO_WIPE}" = "1" ]; then
         args+=(--wipe-bcache)
     fi
     args+=(-B "${NEW_BACKING[@]}")
 
+    # make-bcache refuses foreign filesystem and partition signatures even
+    # when the wrapper's --force guard allowed them. Clear them only after
+    # every disk passed the mount checks and the operator confirmed.
+    if [ "${FORCE}" = "1" ]; then
+        for dev in "${NEW_BACKING[@]}"; do
+            run_external wipefs --all --force -- "${dev}"
+            audit "cleared signatures on ${dev} with wipefs"
+        done
+    fi
     run_external make-bcache "${args[@]}"
     audit "formatted ${NEW_BACKING[*]} as bcache backing device(s): make-bcache ${args[*]}"
 }
@@ -2011,17 +2112,17 @@ attach_one() {
     fi
 
     sysfs_write "${dir}/attach" "${uuid}"
+    # The kernel sets the link up asynchronously. A missing or wrong link
+    # after the wait means the attach did not succeed, so neither the audit
+    # trail nor the snapshot may claim otherwise.
+    if ! wait_for_condition "the cache link of ${label} to ${uuid}" 10 backing_attached_to_set "${dir}" "${uuid}"; then
+        die "${label}: not attached to cache set ${uuid} after 10s; check 'dmesg' for the reason"
+    fi
     audit "attached ${BDEV[${idx}|dev_path]} (${label}) to cache set ${uuid}"
 
-    # Keep the snapshot in line with what was just done, so a cache mode set
-    # right afterwards does not report the device as uncached.
+    # Keep the snapshot in line with the verified result so an immediate
+    # cache-mode change reports the device as cached.
     BDEV["${idx}|cache_set"]="${uuid}"
-
-    # The kernel sets the link up asynchronously; a short wait turns a
-    # silently ignored UUID into a reported failure.
-    if ! wait_for_condition "the cache link of ${label}" 10 backing_is_attached "${dir}"; then
-        warn "${label}: the cache link did not appear within 10s; check 'dmesg' for the reason"
-    fi
     return 0
 }
 
@@ -2060,6 +2161,12 @@ cmd_attach() {
                 die "make-bcache not found; install bcache-tools"
             fi
             warn "make-bcache not found; the real run will fail until bcache-tools is installed"
+        fi
+        if [ "${FORCE}" = "1" ] && ! command -v wipefs >/dev/null 2>&1; then
+            if [ "${DRY_RUN}" != "1" ]; then
+                die "wipefs not found; it is required for attach -B --force"
+            fi
+            warn "wipefs not found; the real --force run will fail until util-linux is installed"
         fi
         for dev in "${NEW_BACKING[@]}"; do
             guard_fresh_device "${dev}" "backing device"
