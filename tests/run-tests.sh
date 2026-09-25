@@ -25,7 +25,7 @@
 # Usage:
 #   run-tests.sh [-v|--verbose] [-k|--keep]
 #
-# Version: 2.0.1  (2026-09-25)
+# Version: 2.0.2  (2026-09-25)
 
 set -uo pipefail
 
@@ -718,6 +718,13 @@ test_guards() {
     FORCE=0
     rm -rf -- "${holders}"
 
+    # A backing device that is not running has no bcache name and therefore
+    # no stack above it; the guard must pass instead of tripping over the
+    # empty list.
+    out="$( (BDEV[1|bcache_dev]=""; guard_device_in_use 1 "stop") 2>&1 )"
+    rc="$?"
+    assert_equal "a device without a bcache name passes" "0" "${rc}"
+
     # The unused device must pass without --force.
     out="$( (guard_device_in_use 1 "stop") 2>&1 )"
     rc="$?"
@@ -833,6 +840,23 @@ test_device_guards() {
     out="$( (guard_fresh_device "${loop}" "backing device") 2>&1 )"
     rc="$?"
     assert_equal "an empty device is accepted" "0" "${rc}"
+
+    # A holder is refused even with --force: make-bcache could not open the
+    # disk exclusively, and the --force path would have wiped the label of
+    # the live layer before finding out. The holder lookup is replaced here
+    # because a real device-mapper layer cannot be built in the suite.
+    out="$(
+        FORCE=1
+        holders_of_stack() { printf 'dm-0'; }
+        guard_fresh_device "${loop}" "backing device" 2>&1
+    )"
+    rc="$?"
+    assert_equal "a held device is refused even with --force" "1" "${rc}"
+    if [[ "${out}" == *"in use by dm-0"* ]]; then
+        report 1 "the refusal names the holding layer" ""
+    else
+        report 0 "the refusal names the holding layer" "got: ${out}"
+    fi
 
     # A device carrying a filesystem must be refused by name.
     if command -v mkfs.ext4 >/dev/null 2>&1; then

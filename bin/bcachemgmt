@@ -45,7 +45,7 @@
 #   bcache-tools are required for "attach -B" only. "wipefs" is also needed
 #   when "attach -B" is used with --force.
 #
-# Version: 2.0.1  (2026-09-25)
+# Version: 2.0.2  (2026-09-25)
 
 # Robustness baseline. Sysfs reads that are allowed to fail are handled
 # explicitly inside sysfs_read().
@@ -62,7 +62,7 @@ set -euo pipefail
 shopt -s nullglob
 
 SCRIPT_NAME="$(basename -- "${0}")"
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.0.2"
 
 # --- Settings -------------------------------------------------------------
 # Every setting is seeded from its environment variable, falling back to the
@@ -172,11 +172,12 @@ Options for the changing commands:
                     "attach -B" and "detach" in a non-interactive context.
                     Env: BCACHEMGMT_YES            Default: 0
   -f, --force       Override the safety guards: for "attach -B" a partition
-                    table, a holder or a foreign signature on the fresh
-                    disk, for "detach --stop" a mounted or otherwise used
-                    bcache device. With "attach -B", wipefs clears existing
-                    signatures before formatting. A mounted fresh disk or
-                    any mounted device above it is never accepted.
+                    table or a foreign signature on the fresh disk, which
+                    wipefs then clears before formatting; for "detach
+                    --stop" a mounted or otherwise used bcache device. A
+                    fresh disk that is mounted or held by another layer
+                    (LVM, dm-crypt, MD), directly or through a partition,
+                    is never accepted.
                     Env: BCACHEMGMT_FORCE          Default: 0
   -c, --cache-set SET
                     The cache set to work on. "set-cache-mode" changes every
@@ -1176,6 +1177,9 @@ device_stack_names() {
 mount_points_of_stack() {
     local -a names=()
     mapfile -t names < <(device_stack_names "${1}")
+    # Guarded because bash before 4.4 treats an empty array as unset under
+    # "set -u"; the stack is empty for a device without a bcache name.
+    [ "${#names[@]}" -gt 0 ] || return 0
     mount_points_of_names "${names[@]}"
 }
 
@@ -1208,6 +1212,7 @@ holders_of_stack() {
     local -a names=()
 
     mapfile -t names < <(device_stack_names "${1}")
+    [ "${#names[@]}" -gt 0 ] || { printf ''; return 0; }
     for name in "${names[@]}"; do
         found="$(holders_of "${name}")"
         if [ -n "${found}" ]; then
@@ -1908,11 +1913,14 @@ guard_fresh_device() {
         fi
         warn "${dev} is partitioned (${parts// /, }) and is being formatted anyway because --force was given"
     fi
+    # A holder is never overridable, unlike a partition table or a foreign
+    # signature. make-bcache opens the device with O_EXCL and fails on a
+    # device an active layer (LVM, dm-crypt, MD) holds, but only after the
+    # --force path has run "wipefs --all --force", which does not need an
+    # exclusive open. The result would be a live LVM or RAID layer whose
+    # on-disk label is gone, and nothing formatted.
     if [ -n "${holders}" ]; then
-        if [ "${FORCE}" != "1" ]; then
-            die "refusing to use ${dev} as a ${purpose}: it is in use by ${holders}; dismantle that layer first or pass --force"
-        fi
-        warn "${dev} is in use by ${holders} and is being formatted anyway because --force was given"
+        die "refusing to use ${dev} as a ${purpose}: it is in use by ${holders}; dismantle that layer first"
     fi
 
     if ! signature="$(device_signature "${dev}")"; then

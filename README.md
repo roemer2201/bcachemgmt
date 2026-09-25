@@ -135,11 +135,13 @@ A fresh disk given with `-B` goes through these steps:
    be a block device, not be mounted, carry no partitions or holders, not be
    registered with bcache and carry no signature (probed directly with
    `blkid --probe`, so a missing udev database cannot hide a filesystem).
-   `--force` allows partitions, holders and foreign signatures; after
-   confirmation, `wipefs --all --force` clears their signatures before
-   formatting. A mount anywhere above the disk, including one on a
-   partition or device-mapper holder, is always refused. `--wipe` allows
-   overwriting an old bcache superblock.
+   `--force` allows a partition table and foreign signatures; after
+   confirmation, `wipefs --all --force` clears them before formatting. A
+   mount or a holder (LVM, dm-crypt, MD) anywhere above the disk, including
+   on a partition, is always refused: `make-bcache` could not open such a
+   disk exclusively anyway, and wiping it first would destroy the label of a
+   live layer. `--wipe` allows overwriting an old bcache
+   superblock.
 2. One confirmation for all disks (`--yes` in scripts).
 3. `make-bcache -B` formats them. The block size passed on is the larger of
    the cache set block size and the logical block sizes of all fresh disks.
